@@ -2,13 +2,13 @@
 
 ## 参考リンク
 
-[rust-fuse](https://github.com/zargony/rust-fuse)
+[rust-fuse](https://github.com/zargony/rust-fuse) : Rust版Fuseプロジェクト
 
-[libfuse](https://github.com/libfuse/libfuse)
+[libfuse](https://github.com/libfuse/libfuse) : C版のFuseインターフェースライブラリ
 
-[osxfuse](https://github.com/osxfuse/fuse)
+[osxfuse](https://github.com/osxfuse/fuse) : MacOS向けのFuseインターフェースライブラリ
 
-[FUSEプロトコルの説明](https://john-millikin.com/the-fuse-protocol)
+[FUSEプロトコルの説明](https://john-millikin.com/the-fuse-protocol) : カーネルモジュール <-> Fuseライブラリ間のプロトコル
 
 [VFSの説明](http://archive.linux.or.jp/JF/JFdocs/Linux-Kernel-Internals-3.html)
 
@@ -20,8 +20,10 @@
 
 [libfuseのメーリングリストのアーカイブ](https://sourceforge.net/p/fuse/mailman/fuse-devel/)
 
+[gcfs(rust-fuseの実装例)](https://github.com/harababurel/gcsf)
+
 ## データベース構造
-テーブルはメタデータ(MDT)とディレクトリエントリ(DET)とブロックデータ(BDT)と拡張属性データ(XATTRT)の3つに分ける。
+テーブルはメタデータ(MDT)とディレクトリエントリ(DET)とブロックデータ(BDT)と拡張属性データ(XATTRT)の4つに分ける。
 
 ### MDT
 メタデータは一般的なファイルシステムのメタデータと同様で、fuseが必要なデータを持つ。
@@ -262,9 +264,9 @@ pub trait Filesystem {
 ```
 
 ### 戻り値
-各関数は `reply` 引数で戻り値の形式が指定されるので、
+各関数に戻り値は存在せず、 `reply` 引数を操作して、呼び出し元に値を受け渡す。
 
-`reply.ok()` `reply.error(ENOSYS)` `reply.attr(...)` 等を使って戻り値を返す。
+`reply.ok()` `reply.error(ENOSYS)` `reply.attr(...)` 等を使う。
 
 ### init
 マウント後最初に呼ばれる。初期化が必要な場合、ここで行う。
@@ -462,7 +464,8 @@ inodeで指定されたファイルをoffsetからsize分読み込む
 
 ファイルの読み込む位置を指定する方法は色々とあるが、fuseは `pread(2)` 相当の関数を一つ実装するだけで済むようにしてくれている。
 
-EOFまたはエラーを返す場合を除いて、readはsizeで指定されたサイズのデータを返さないといけない。返せない場合は0埋めする。  
+EOFまたはエラーを返す場合を除いて、readはsizeで指定されたサイズのデータを返さないといけない。実データが足りなくて返せない場合は0埋めする。  
+例えば、長さ200byteのデータに対して、4096byteの要求が来ることがあるので、3896byte分を0埋めして返さなければならない。  
 例外として、`direct_io` フラグを指定した場合、カーネルは `read(2)` システムコールの戻り値として、
 ファイルシステムの戻り値を直接使うので、sizeより小さいデータを返してもよい。
 
@@ -543,6 +546,8 @@ result = reply.add(target_inode, offset, FileType.RegularFile, filename);
 `0` は「最初のディレクトリエントリ」を指すので、 `offset` に0を入れてはならない。
 
 `.` と `..` は返さなくともよいが、返さなかった場合の処理は呼び出し側のプログラムに依存する。
+
+`reply.add()` でデータを追加していき、最終的に `reply.ok()` を実行すると、データが返せる。
 
 ### releasedir
 `opendir` で確保したリソースを解放する。  
@@ -687,5 +692,3 @@ fn main() {
     fuse::mount(SqliteFS, mountpoint, &options).unwrap();
 }
 ```
-
-
