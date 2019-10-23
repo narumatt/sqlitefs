@@ -1,15 +1,11 @@
-use failure::Error;
 use fuse::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
-    ReplyEntry, ReplyStatfs, ReplyWrite, Request,
+    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
-use libc::{ENOENT, ENOTDIR, ENOTRECOVERABLE, EREMOTE, c_int, S_IFIFO, S_IFCHR, S_IFBLK, S_IFDIR, S_IFREG, S_IFLNK, S_IFSOCK};
+use libc::{ENOENT, S_IFIFO, S_IFCHR, S_IFBLK, S_IFDIR, S_IFREG, S_IFLNK, S_IFSOCK};
 use std::path::Path;
 use std::ffi::OsStr;
-use std::collections::HashMap;
-use crate::db_module::{DBFileAttr, DEntry, sqlite, DbModule};
+use crate::db_module::DbModule;
 use crate::db_module::sqlite::Sqlite;
-use crate::sqerror;
 use crate::sqerror::SqError;
 use time::Timespec;
 
@@ -19,7 +15,6 @@ const ONE_SEC: Timespec = Timespec{
 };
 
 pub struct SqliteFs{
-    lookup: HashMap<u32, u32>,
     db: Sqlite,
 }
 
@@ -29,7 +24,7 @@ impl SqliteFs {
             Ok(n) => n,
             Err(err) => return Err(err)
         };
-        Ok(SqliteFs{lookup: HashMap::new(), db})
+        Ok(SqliteFs{db})
     }
 }
 
@@ -63,7 +58,7 @@ impl Filesystem for SqliteFs {
             let b_num = offset / block_size + 1;
             let mut b_data = match self.db.get_data(ino as u32, b_num, block_size) {
                 Ok(n) => n,
-                Err(err) => {reply.error(ENOENT); return; }
+                Err(_err) => {reply.error(ENOENT); return; }
             };
             let b_offset = offset % block_size;
             let b_end = if (size + b_offset) / block_size >= 1 {block_size} else {size + b_offset};
@@ -90,6 +85,7 @@ impl Filesystem for SqliteFs {
                 S_IFIFO => FileType::NamedPipe,
                 S_IFCHR => FileType::CharDevice,
                 S_IFBLK => FileType::BlockDevice,
+                S_IFSOCK => FileType::Socket,
                 _ => FileType::Socket,
             };
             reply.add(entry.child_ino as u64, (i + 1) as i64, kind, &entry.filename);

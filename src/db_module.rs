@@ -6,24 +6,12 @@ use time::Timespec;
 use libc::{S_IFIFO, S_IFCHR, S_IFBLK, S_IFDIR, S_IFREG, S_IFLNK, S_IFSOCK};
 
 pub trait DbModule {
-    /// Create database and initialize table
-    fn init_database(&self) -> Result<(),SqError>;
-    /// Add file inode data
-    fn add_inode(&self, attr: &DBFileAttr) -> Result<(), SqError>;
     /// Get file metadata. If not found, return ino 0
     fn get_inode(&self, inode: u32) -> Result<DBFileAttr, SqError>;
-    /// Add a single directory entry
-    fn add_dentry(&self, entry: &DEntry) -> Result<(), SqError>;
     /// Get directory entries
     fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>, SqError>;
     /// lookup a directory entry table and get a file attribute
     fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr, SqError>;
-    /// Add 1 to nlink
-    fn increase_nlink(&self, inode: u32) -> Result<u32, SqError>;
-    /// Remove 1 from nlink
-    fn decrease_nlink(&self, inode: u32) -> Result<u32, SqError>;
-    /// Write data.
-    fn add_data(&self, inode: u32, block: u32, data: &[u8]) -> Result<(), SqError>;
     /// Read data.
     fn get_data(&self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>, SqError>;
     /// Get block size of filesystem
@@ -86,6 +74,8 @@ impl DBFileAttr {
             FileType::CharDevice
         } else if perm & S_IFBLK != 0 {
             FileType::BlockDevice
+        } else if perm & S_IFSOCK != 0 {
+            FileType::Socket
         } else {
             FileType::Socket
         }

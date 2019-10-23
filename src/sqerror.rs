@@ -1,4 +1,3 @@
-use failure::Error;
 use std::error::Error as stdError;
 use rusqlite;
 

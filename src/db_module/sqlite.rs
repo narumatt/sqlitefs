@@ -4,11 +4,8 @@ use chrono::{Utc, DateTime, NaiveDateTime, Timelike};
 use rusqlite::types::ToSql;
 use rusqlite::{params, Connection, NO_PARAMS, Transaction, Statement};
 use crate::db_module::{DbModule, DBFileAttr, DEntry};
-use libc::{S_IRWXU, S_IFDIR};
 use crate::sqerror::SqError;
 use std::sync::{Mutex, MutexGuard};
-use std::fs::OpenOptions;
-use std::error::Error;
 
 const EMPTY_ATTR: DBFileAttr = DBFileAttr {
 ino: 0,
@@ -28,10 +25,6 @@ flags: 0
 
 const BLOCK_SIZE: u32 = 4096;
 
-macro_rules! parse_attr_row {
-    ($row:ident) => {{}};
-}
-
 pub struct Sqlite {
     conn: Mutex<Connection>
 }
@@ -44,66 +37,10 @@ impl Sqlite {
         Ok(Sqlite { conn: Mutex::new(conn) })
     }
 
-    pub fn table_exists(&self) -> Result<bool, SqError> {
-        let connect = self.conn.lock().unwrap();
-        let mut stmt = connect
-            .prepare("SELECT count(name) FROM sqlite_master WHERE type='table' AND name=$1")?;
-        let res: i32 = stmt.query_row(params!["metadata"], |row| {row.get(0)})?;
-        if res != 0 {
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
-    pub fn get_nlink(&self, inode: u32, tx: Option<&Transaction>) -> Result<u32, SqError> {
-        let sql = "SELECT nlink FROM metadata WHERE id=$1";
-        let res:u32;
-        match tx {
-            Some(tx) => {
-                let mut stmt = tx.prepare(sql)?;
-                res = stmt.query_row(params![inode], |row| { row.get(0) })?;
-            },
-            None => {
-                let connect = self.conn.lock().unwrap();
-                let mut stmt = connect.prepare(sql)?;
-                res = stmt.query_row(params![inode], |row| { row.get(0) })?;
-            }
-        }
-        Ok(res)
-    }
-
     fn string_to_systemtime(&self, text: String, nsec: u32) -> SystemTime {
         SystemTime::from(DateTime::<Utc>::from_utc(
             NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S").unwrap().with_nanosecond(nsec).unwrap(), Utc
         ))
-    }
-
-    fn search_inode_from_name(&self, parent: u32, name: &str, tx: Option<&Transaction>) -> Result<u32, SqError> {
-        let sql = "SELECT child_id FROM dentry where parent_id=$1 and name=$2";
-        let res: u32;
-        let connect: MutexGuard<Connection>;
-        let mut stmt: Statement = match tx {
-            Some(tx) => {
-                tx.prepare(sql)?
-
-            },
-            None => {
-                connect = self.conn.lock().unwrap();
-                connect.prepare(sql)?
-            }
-        };
-        let row: u32 = match stmt.query_row(params![parent, name], |row| row.get(0)) {
-            Ok(n) => n,
-            Err(err) => {
-                if err == rusqlite::Error::QueryReturnedNoRows {
-                    0
-                } else {
-                    return Err(SqError::from(err))
-                }
-            }
-        };
-        Ok(row)
     }
 
     fn get_inode_local(&self, inode: u32, tx: Option<&Transaction>) -> Result<DBFileAttr, SqError> {
@@ -129,7 +66,7 @@ impl Sqlite {
             LEFT JOIN (SELECT count(block_num) block_num from data where file_id=$1) as blocknum
             where id=$1";
         let connect: MutexGuard<Connection>;
-        let mut stmt = match tx {
+        let stmt = match tx {
             Some(tx) => {
                 tx.prepare(sql)?
             },
@@ -173,166 +110,11 @@ impl Sqlite {
             Ok(attrs[0])
         }
     }
-
-    fn get_block_count(&self, inode: u32) -> Result<u32, SqError> {
-        let sql = "SELECT count(block_num) from data where file_id=$1";
-        let connect = self.conn.lock().unwrap();
-        let mut stmt = connect.prepare(sql)?;
-        let res: u32 = stmt.query_row(params![inode], |row| {row.get(0)})?;
-        Ok(res)
-    }
 }
 
 impl DbModule for Sqlite {
-    /// Create table and insert root entry for empty database
-    fn init_database(&self) -> Result<(), SqError> {
-        // inode table
-        {
-            let connect = self.conn.lock().unwrap();
-            connect.execute("CREATE TABLE metadata(\
-            id integer primary key,\
-            size int default 0 not null,\
-            atime text,\
-            atime_nsec int,\
-            mtime text,\
-            mtime_nsec int,\
-            ctime text,\
-            ctime_nsec int,\
-            crtime text,\
-            crtime_nsec int,\
-            mode int,\
-            nlink int default 0 not null,\
-            uid int default 0,\
-            gid int default 0,\
-            rdev int default 0,\
-            flags int default 0\
-            )", NO_PARAMS)?;
-            // data table
-            connect.execute("CREATE TABLE data(\
-            file_id int,\
-            block_num int,\
-            data blob,\
-            foreign key (file_id) references metadata(id) on delete cascade,\
-            primary key (file_id, block_num)\
-            )", NO_PARAMS)?;
-            // directory entry table
-            connect.execute("CREATE TABLE dentry(\
-            parent_id int,\
-            child_id int,\
-            file_type int,\
-            name text,\
-            foreign key (parent_id) references metadata(id) on delete cascade,\
-            foreign key (child_id) references metadata(id) on delete cascade,\
-            primary key (parent_id, name)\
-            )", NO_PARAMS)?;
-            // extended attribute table
-            connect.execute("CREATE TABLE xattr(\
-            file_id int,\
-            name text,\
-            value blob,\
-            foreign key (file_id) references metadata(id) on delete cascade,\
-            primary key (file_id, name)\
-            )", NO_PARAMS)?;
-        }
-        // insert root dir info.
-        let now = SystemTime::now();
-        self.add_inode(&DBFileAttr {
-            ino: 1,
-            size: 0,
-            blocks: 0,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
-            perm: (S_IFDIR | S_IRWXU) as u16,
-            nlink: 0,
-            uid: 0,
-            gid: 0,
-            rdev: 0,
-            flags: 0,
-        })?;
-        self.add_dentry(&DEntry {
-            parent_ino: 1,
-            child_ino: 1,
-            file_type: S_IFDIR,
-            filename: String::from("."),
-        })?;
-        self.add_dentry(&DEntry {
-            parent_ino: 1,
-            child_ino: 1,
-            file_type: S_IFDIR,
-            filename: String::from(".."),
-        })?;
-        self.increase_nlink(1)?;
-        Ok(())
-    }
-
-    fn add_inode(&self, attr: &DBFileAttr) -> Result<(), SqError> {
-        let atime: DateTime<Utc> = attr.atime.into();
-        let mtime: DateTime<Utc> = attr.mtime.into();
-        let ctime: DateTime<Utc> = attr.ctime.into();
-        let crtime: DateTime<Utc> = attr.crtime.into();
-        self.conn.lock().unwrap().execute("INSERT INTO metadata\
-            (id,\
-            size,\
-            atime,\
-            atime_nsec,\
-            mtime,\
-            mtime_nsec,\
-            ctime,\
-            ctime_nsec,\
-            crtime,\
-            crtime_nsec,\
-            mode,\
-            nlink,\
-            uid,\
-            gid,\
-            rdev,\
-            flags) \
-            VALUES($1,\
-            $2,\
-            datetime($3),\
-            $4,\
-            datetime($5),\
-            $6,\
-            datetime($7),\
-            $8,\
-            datetime($9),\
-            $10,\
-            $11, $12, $13, $14, $15, $16\
-            )", params![
-                attr.ino,
-                attr.size,
-                atime.format("%Y-%m-%d %H:%M:%S").to_string(),
-                atime.timestamp_subsec_nanos(),
-                mtime.format("%Y-%m-%d %H:%M:%S").to_string(),
-                mtime.timestamp_subsec_nanos(),
-                ctime.format("%Y-%m-%d %H:%M:%S").to_string(),
-                ctime.timestamp_subsec_nanos(),
-                crtime.format("%Y-%m-%d %H:%M:%S").to_string(),
-                crtime.timestamp_subsec_nanos(),
-                attr.perm,
-                attr.nlink,
-                attr.uid,
-                attr.gid,
-                attr.rdev,
-                attr.flags
-        ])?;
-        Ok(())
-    }
-
     fn get_inode(&self, inode: u32) -> Result<DBFileAttr, SqError> {
         self.get_inode_local(inode, None)
-    }
-
-     fn add_dentry(&self, entry: &DEntry) -> Result<(), SqError> {
-        self.conn.lock().unwrap().execute("INSERT INTO dentry \
-            (parent_id, child_id, file_type, name)
-            VALUES($1, $2, $3, $4)",
-         params![
-                entry.parent_ino, entry.child_ino, entry.file_type, entry.filename
-            ])?;
-        Ok(())
     }
 
     fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>, SqError> {
@@ -381,37 +163,9 @@ impl DbModule for Sqlite {
             ON dentry.child_id = blocknum.file_id
             ";
         let connect = self.conn.lock().unwrap();
-        let mut stmt = connect.prepare(sql)?;
+        let stmt = connect.prepare(sql)?;
         let params = params![parent, name];
         self.parse_attr(stmt, params)
-    }
-
-    fn increase_nlink(&self, inode: u32) -> Result<u32, SqError> {
-        let mut connect = self.conn.lock().unwrap();
-        let tx = connect.transaction()?;
-        let num = self.get_nlink(inode, Some(&tx))? + 1;
-        tx.execute("UPDATE metadata SET nlink=$1 where id=$2",
-      params![num, inode])?;
-        tx.commit()?;
-        Ok(num)
-    }
-
-    fn decrease_nlink(&self, inode: u32) -> Result<u32, SqError> {
-        let mut connect = self.conn.lock().unwrap();
-        let tx = connect.transaction()?;
-        let num = self.get_nlink(inode, Some(&tx))? - 1;
-        tx.execute("UPDATE metadata SET nlink=$1 where id=$2",
-                          params![num, inode])?;
-        tx.commit()?;
-        Ok(num)
-    }
-
-    fn add_data(&self, inode:u32, block: u32, data: &[u8]) -> Result<(), SqError> {
-        self.conn.lock().unwrap().execute("REPLACE INTO data \
-            (file_id, block_num, data)
-            VALUES($1, $2, $3)",
-          params![inode, block, data])?;
-        Ok(())
     }
 
     fn get_data(&self, inode:u32, block: u32, length: u32) -> Result<Vec<u8>, SqError> {
