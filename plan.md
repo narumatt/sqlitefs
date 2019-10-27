@@ -77,6 +77,7 @@ pub struct FileAttr {
 |ctime_nsec|int|ステータス変更時刻(小数点以下)|
 |crtime|text|作成時刻(mac用)|
 |crtime_nsec|int|作成時刻(小数点以下)|
+|kind|int|ファイル種別|
 |mode|int|パーミッション(ファイル種別含む)|
 |nlink|int|ハードリンク数|
 |uid|int|uid|
@@ -84,8 +85,10 @@ pub struct FileAttr {
 |rdev|int|デバイスタイプ|
 |flags|int|フラグ(mac用)|
 
-permとkindはmodeから得る。 `libc::S_IFREG` 等を使うとよい。  
+mknod時のkindはmodeから得る。 `libc::S_IFREG` 等を使うとよい。  
 なぜか `S_ISREG` は無い…
+
+それ以外(create, mkdir)の場合ファイル種類は自明である。
 
 ### BDT
 BDTのblobにデータを格納する。
@@ -357,7 +360,7 @@ _bkuptime: Option<SystemTime>
 
 ### mknod
 親ディレクトリのinode, ファイル名, モード, デバイス番号が指定されるので、ファイルまたはスペシャルファイルを作成する。 `create` が定義されている場合、通常ファイルについてはそちらが呼ばれる。  
-大抵の仮想ファイルシステムではスペシャルファイルはエラーでよいと思うが、少なくとも通常ファイルが作成できるようにしておかないといけない。  
+大抵の仮想ファイルシステムではスペシャルファイルはエラーでよいと思われる。mknodを実装していないシステムも多い。  
 作成対象がどのファイルかは `_mode` で調べる。 例えば通常ファイルかどうか調べる場合は `libc::S_IFREG` を使うとよい。
 
 ### mkdir

@@ -1,7 +1,7 @@
 use fuse::{
-    FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
+    Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
-use libc::{ENOENT, S_IFIFO, S_IFCHR, S_IFBLK, S_IFDIR, S_IFREG, S_IFLNK, S_IFSOCK};
+use libc::ENOENT;
 use std::path::Path;
 use std::ffi::OsStr;
 use crate::db_module::DbModule;
@@ -78,18 +78,11 @@ impl Filesystem for SqliteFs {
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
         for (i, entry) in db_entries.into_iter().enumerate().skip(offset as usize) {
-            let kind = match entry.file_type {
-                S_IFREG => FileType::RegularFile,
-                S_IFDIR => FileType::Directory,
-                S_IFLNK=> FileType::Symlink,
-                S_IFIFO => FileType::NamedPipe,
-                S_IFCHR => FileType::CharDevice,
-                S_IFBLK => FileType::BlockDevice,
-                S_IFSOCK => FileType::Socket,
-                _ => FileType::Socket,
-            };
-            reply.add(entry.child_ino as u64, (i + 1) as i64, kind, &entry.filename);
-            debug!("filesystem:readdir, ino: {:?} offset: {:?} kind: {:?} name: {}", entry.child_ino as u64, (i + 1) as i64, kind, entry.filename);
+            let full = reply.add(entry.child_ino as u64, (i + 1) as i64, entry.file_type, &entry.filename);
+            if full {
+                break;
+            }
+            debug!("filesystem:readdir, ino: {:?} offset: {:?} kind: {:?} name: {}", entry.child_ino as u64, (i + 1) as i64, entry.file_type, entry.filename);
         }
         reply.ok();
     }

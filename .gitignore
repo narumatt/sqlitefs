@@ -4,3 +4,4 @@
 *.sqlite
 *.sqlite3
 *.db
+.idea/

@@ -6,6 +6,15 @@ use rusqlite::{params, Connection, NO_PARAMS, Transaction, Statement};
 use crate::db_module::{DbModule, DBFileAttr, DEntry};
 use crate::sqerror::SqError;
 use std::sync::{Mutex, MutexGuard};
+use fuse::FileType;
+
+const DB_IFIFO: u32 = 0o0010000;
+const DB_IFCHR: u32 = 0o0020000;
+const DB_IFDIR: u32 = 0o0040000;
+const DB_IFBLK: u32 = 0o0060000;
+const DB_IFREG: u32 = 0o0100000;
+const DB_IFLNK: u32 = 0o0120000;
+const DB_IFSOCK: u32 = 0o0140000;
 
 const EMPTY_ATTR: DBFileAttr = DBFileAttr {
 ino: 0,
@@ -15,6 +24,7 @@ atime: UNIX_EPOCH,
 mtime: UNIX_EPOCH,
 ctime: UNIX_EPOCH,
 crtime: UNIX_EPOCH,
+kind: FileType::RegularFile,
 perm: 0,
 nlink: 0,
 uid: 0,
@@ -33,7 +43,7 @@ impl Sqlite {
     pub fn new(path: &Path) -> Result<Self, SqError> {
         let conn = Connection::open(path)?;
         // enable foreign key. Sqlite ignores foreign key by default.
-        conn.execute("PRAGMA foreign_keys=true", NO_PARAMS)?;
+        conn.execute("PRAGMA foreign_keys=ON", NO_PARAMS)?;
         Ok(Sqlite { conn: Mutex::new(conn) })
     }
 
@@ -41,6 +51,31 @@ impl Sqlite {
         SystemTime::from(DateTime::<Utc>::from_utc(
             NaiveDateTime::parse_from_str(&text, "%Y-%m-%d %H:%M:%S").unwrap().with_nanosecond(nsec).unwrap(), Utc
         ))
+    }
+
+    fn file_type_to_const(&self, kind: FileType) -> u32 {
+        match kind {
+            FileType::RegularFile => DB_IFREG,
+            FileType::Socket => DB_IFSOCK,
+            FileType::Directory => DB_IFDIR,
+            FileType::Symlink => DB_IFLNK,
+            FileType::BlockDevice => DB_IFBLK,
+            FileType::CharDevice => DB_IFCHR,
+            FileType::NamedPipe => DB_IFIFO,
+        }
+    }
+
+    fn const_to_file_type(&self, kind: u32) -> FileType {
+        match kind {
+            DB_IFREG => FileType::RegularFile,
+            DB_IFSOCK => FileType::Socket,
+            DB_IFDIR => FileType::Directory,
+            DB_IFLNK => FileType::Symlink,
+            DB_IFBLK => FileType::BlockDevice,
+            DB_IFCHR => FileType::CharDevice,
+            DB_IFIFO => FileType::NamedPipe,
+            _ => FileType::RegularFile,
+        }
     }
 
     fn get_inode_local(&self, inode: u32, tx: Option<&Transaction>) -> Result<DBFileAttr, SqError> {
@@ -55,6 +90,7 @@ impl Sqlite {
             metadata.ctime_nsec,\
             metadata.crtime,\
             metadata.crtime_nsec,\
+            metadata.kind, \
             metadata.mode,\
             metadata.nlink,\
             metadata.uid,\
@@ -83,17 +119,18 @@ impl Sqlite {
         Ok(DBFileAttr {
             ino: row.get(0)?,
             size: row.get(1)?,
-            blocks: row.get(16)?,
+            blocks: row.get(17)?,
             atime: self.string_to_systemtime(row.get(2)?, row.get(3)?),
             mtime: self.string_to_systemtime(row.get(4)?, row.get(5)?),
             ctime: self.string_to_systemtime(row.get(6)?, row.get(7)?),
             crtime: self.string_to_systemtime(row.get(8)?, row.get(9)?),
-            perm: row.get(10)?,
-            nlink: row.get(11)?,
-            uid: row.get(12)?,
-            gid: row.get(13)?,
-            rdev: row.get(14)?,
-            flags: row.get(15)?
+            kind: self.const_to_file_type(row.get(10)?),
+            perm: row.get(11)?,
+            nlink: row.get(12)?,
+            uid: row.get(13)?,
+            gid: row.get(14)?,
+            rdev: row.get(15)?,
+            flags: row.get(16)?
         })
     }
 
@@ -124,7 +161,7 @@ impl DbModule for Sqlite {
         let rows = stmt.query_map(params![inode], |row| {
             Ok(DEntry{parent_ino: inode,
                 child_ino: row.get(0)?,
-                file_type: row.get(1)?,
+                file_type: self.const_to_file_type(row.get(1)?),
                 filename: row.get(2)?,
             })
         })?;
@@ -147,6 +184,7 @@ impl DbModule for Sqlite {
             metadata.ctime_nsec,\
             metadata.crtime,\
             metadata.crtime_nsec,\
+            metadata.kind, \
             metadata.mode,\
             metadata.nlink,\
             metadata.uid,\

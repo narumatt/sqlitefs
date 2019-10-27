@@ -3,7 +3,6 @@ use std::time::SystemTime;
 use crate::sqerror::SqError;
 use fuse::{FileAttr, FileType};
 use time::Timespec;
-use libc::{S_IFIFO, S_IFCHR, S_IFBLK, S_IFDIR, S_IFREG, S_IFLNK, S_IFSOCK};
 
 pub trait DbModule {
     /// Get file metadata. If not found, return ino 0
@@ -20,7 +19,7 @@ pub trait DbModule {
 
 // Imported from rust-fuse 4.0-dev
 // This time format differs from v3.1
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq)]
 pub struct DBFileAttr {
     /// Inode number
     pub ino: u32,
@@ -36,6 +35,8 @@ pub struct DBFileAttr {
     pub ctime: SystemTime,
     /// Time of creation (macOS only)
     pub crtime: SystemTime,
+    /// file type
+    pub kind: FileType,
     /// Permissions
     pub perm: u16,
     /// Number of hard links
@@ -60,27 +61,6 @@ impl DBFileAttr {
         }
     }
 
-    fn kind_from(&self, _perm: u16) -> FileType {
-        let perm = _perm as u32;
-        if perm & S_IFREG != 0 {
-            FileType::RegularFile
-        } else if perm & S_IFDIR != 0 {
-            FileType::Directory
-        } else if perm & S_IFLNK != 0 {
-            FileType::Symlink
-        } else if perm & S_IFIFO != 0{
-            FileType::NamedPipe
-        } else if perm & S_IFCHR != 0 {
-            FileType::CharDevice
-        } else if perm & S_IFBLK != 0 {
-            FileType::BlockDevice
-        } else if perm & S_IFSOCK != 0 {
-            FileType::Socket
-        } else {
-            FileType::Socket
-        }
-    }
-
     pub fn get_file_attr(&self) -> FileAttr {
         FileAttr {
             ino: self.ino as u64,
@@ -90,7 +70,7 @@ impl DBFileAttr {
             mtime: self.timespec_from(&self.mtime),
             ctime: self.timespec_from(&self.ctime),
             crtime: self.timespec_from(&self.crtime),
-            kind: self.kind_from(self.perm),
+            kind: self.kind,
             perm: self.perm,
             nlink: self.nlink,
             uid: self.uid,
@@ -105,5 +85,5 @@ pub struct DEntry {
     pub parent_ino: u32,
     pub child_ino: u32,
     pub filename: String,
-    pub file_type: u32
+    pub file_type: FileType,
 }

@@ -10,11 +10,12 @@ use crate::filesystem::SqliteFs;
 fn main() {
     env_logger::init();
     let mountpoint = env::args_os().nth(1).unwrap();
-    let options = ["-o", "ro", "-o", "fsname=hello"]
+    let db_path = env::args_os().nth(2).unwrap();
+    let options = ["-o", "ro", "-o", "fsname=sqlitefs"]
         .iter()
         .map(|o| o.as_ref())
         .collect::<Vec<&OsStr>>();
-    let fs: SqliteFs = match SqliteFs::new("./filesystem.sqlite") {
+    let fs: SqliteFs = match SqliteFs::new(db_path.to_str().unwrap()) {
         Ok(n) => n,
         Err(err) => {println!("{:?}", err); return;}
     };
