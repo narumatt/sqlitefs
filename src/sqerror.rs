@@ -9,6 +9,6 @@ pub enum SqError {
 
 impl From<rusqlite::Error> for SqError {
     fn from(err: rusqlite::Error) -> SqError {
-        SqError::SqliteError {description: String::from(err.description())}
+        SqError::SqliteError {description: String::from(format!("{} {:?}",err.description(), err))}
     }
 }

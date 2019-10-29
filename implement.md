@@ -12,11 +12,11 @@ Filesystem in Userspace(FUSE) はユーザ空間でファイルシステムを�
 ある程度ファイルシステムの知識は必要ですし、チュートリアルを見てもほどほどの所で終わってしまい、「あとはsshfsの実装などを見てくれ！」とコードの海に投げ出されます。
 
 本書は、RustによるFUSEインターフェースの実装である `rust-fuse` を用いてFUSEを使ったファイルシステムの実装に挑戦し、
-気をつけるべき点などを記録したものです。
+得られた知見などを記録したものです。
 
 ## FUSEの仕組み(アバウト)
 
-FUSE本体はLinuxカーネルに付属するカーネルモジュールで、大抵のディストリビューションではデフォルトでビルドされてインストールされています。
+FUSE本体はLinuxカーネルに付属するカーネルモジュールで、大抵のディストリビューションではデフォルトで有効になっています。
 
 FUSEを使ったファイルシステムがマウントされたディレクトリ内に対してシステムコールが呼ばれると、以下のように情報がやりとりされます。
 
@@ -37,10 +37,12 @@ FUSEはデバイス `/dev/fuse` を持ち、ここを通じてユーザ空間と
 
 ## rust-fuse
 Rustには(ほぼ)独自のFUSEインターフェースの実装 `Rust FUSE(rust-fuse)` があります。ありがたいですね。  
-元々プロトコルが同じなので、インターフェースの関数はlibfuseと大変似ています。そのため、何か困った時にはlibfuseの情報が流用できたりします。ありがたいですね。
+プロトコルが同じなので、インターフェースの関数はlibfuseのlowlevel関数と大変似ています。そのため、何か困った時にはlibfuseの情報が流用できたりします。ありがたいですね。
 
 現時点(2019/10) の最新版は0.3.1で、2年ぐらい更新されていませんが、次バージョン(0.4.0)が開発中です。  
 0.3.1と0.4.0では日時関係の型が大幅に違うので注意してください。
+
+libfuseはマルチスレッドで動作し、並列I/Oに対応していますが、rust-fuseはシングルスレッドのようです。
 
 # データの保存先
 今回自分でファイルシステムを実装していく上で、HDDの代わりになるデータの保存先としてsqliteを使用します。
@@ -217,11 +219,11 @@ FUSEでは、ルートディレクトリのinodeは1です。
 
 # Hello!
 ## 概要
-第一段階として、rust-fuseに付属する、サンプルプログラムの `HelloFS` と同じ機能を実装すします。
+第一段階として、rust-fuseに付属する、サンプルプログラムの `HelloFS` と同じ機能を実装します。
 `HelloFS` は以下の機能があります。
 
 1. ファイルシステムはリードオンリー
-1. ルート直下に `hello.txt` というファイルがあり、 `"Hello World!\n"` というデータが読み込める
+1. ルート直下に `hello.txt` というファイルがあり、 `"Hello World!\n"` という文字列が書き込まれている
 
 必要なのは以下の4つの関数です。
 
@@ -269,9 +271,10 @@ pub trait DbModule {
 `Filesystem` トレイトが定義されているので、必要な関数を適宜実装していきます。
 
 ### 戻り値
-各関数に戻り値は存在せず、 `reply` 引数を操作して、呼び出し元に値を受け渡します。
+各関数に戻り値は存在せず、 `reply` 引数を操作して、呼び出し元に値を受け渡します。  
+`ReplyEmpty, ReplyData, ReplyAttr` のように、関数に応じて `reply` の型が決まっています。
 
-`reply.ok()` `reply.error(ENOSYS)` `reply.attr(...)` 等が使えます。
+`reply.ok()` `reply.error(ENOSYS)` `reply.attr(...)` 等 `reply` の型に応じたメソッドが使えます。
 
 ## lookup
 親ディレクトリのinode、当該ディレクトリ/ファイルの名前が与えられるので、ディレクトリエントリとメタデータを返します。  
@@ -302,8 +305,8 @@ TTLの間はカーネルは再度問い合わせに来ません。
 
 inodeの世代情報を `u64` で返します。削除されたinodeに別のファイルを割り当てた場合、
 前のファイルと違うファイルである事を示すために、generationに別の値を割り当てます。  
-ただし、この値をチェックするのは(知られているものでは)nfsしかないです。  
-今回はinodeの使い回しが無いので、常時 `0` に設定します。
+ただし、この値をチェックするのは(知られているものでは)nfsしかありません。  
+今回は常時 `0` に設定します。
 
 [libfuseの説明](https://libfuse.github.io/doxygen/structfuse__entry__param.html#a4c673ec62c76f7d63d326407beb1b463)
 も参考にしてください。
@@ -428,6 +431,8 @@ main関数で `fuse::mount()` を実行すると、マウントできます。
 
 rust-fuseは [env_logger](https://github.com/sebasmagri/env_logger/)に対応しているので、最初に有効にしておきます。  
 `DEBUG` レベルにすると各関数の呼び出しを記録してくれます。
+
+引数の処理はそのうちclapを使うことになるでしょう。マウントオプションとかあるので。
 
 ```
 fn main() {
@@ -590,6 +595,16 @@ fn write(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, data: &
 }
 ```
 
+### マウントオプション
+`main.rs` のReadOnlyのマウントオプションを削除します。
+
+```
+let options = ["-o", "fsname=sqlitefs"]
+    .iter()
+    .map(|o| o.as_ref())
+    .collect::<Vec<&OsStr>>();
+```
+
 ### 実行結果
 
 ```
@@ -696,4 +711,47 @@ Update hello world
 これでファイルの書き込みができるようになりました。  
 次回は、ファイルの作成と削除を実装します。
 
+# ファイルの作成と削除
+ルートディレクトリ上にファイルの作成と削除が行えるようにします。
+
+必要なのは以下の関数です。
+
+```
+fn destroy(&mut self, _req: &Request<'_>) {
+    ...
+}
+fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry){
+    ...
+}
+fn forget(&mut self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {
+    ...
+}
+fn unlink(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
+    reply.error(ENOSYS);
+}
+fn create(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, _mode: u32, _flags: u32, reply: ReplyCreate) {
+    reply.error(ENOSYS);
+}
+```
+
+ファイルを作成する関数は `create` 、削除する関数は `unlink` ですが、 `lookup count` の都合で追加でいろいろ実装する必要があります。
+
+## lookup count
+`lib.rs` や `fuse_lowlevel.h` によると、
+「lookup count が0でない内は、unlink, rmdir, rename(で上書き)されて参照カウントが0になってもinodeを削除しないでね」という事です。  
+lookup countは最初は0で、ReplyEntryとReplyCreateがある全ての関数が呼ばれるたびに、1ずつ増やしていきます。  
+具体的には、 `lookup`, `mknod`, `mkdir`, `symlink`, `link`, `create` です。
+
+`forget` はlookup countを減らす関数です。 `forget` でlookup countが0になるまでは、削除を遅らせます。  
+
+lookup countを実装するために、ファイルシステムの構造体に次の変数を追加します。
+
+```
+pub struct SqliteFs{
+    /// DBとやり取りする
+    db: Sqlite,
+    /// lookup countを保持する
+    lookup_count: Mutex<HashMap<u32, u32>>
+}
+```
 

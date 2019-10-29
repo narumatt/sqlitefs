@@ -8,16 +8,22 @@ use chrono::{DateTime, Utc, NaiveDateTime};
 pub trait DbModule {
     /// Get file metadata. If not found, return ino 0
     fn get_inode(&self, inode: u32) -> Result<DBFileAttr, SqError>;
+    /// Add file.
+    fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32, SqError>;
     /// Update file metadata.
-    fn update_inode(&self, attr: DBFileAttr) -> Result<(), SqError>;
+    fn update_inode(&mut self, attr: DBFileAttr) -> Result<(), SqError>;
+    // Delete inode if link count is zero.
+    fn delete_inode_if_noref(&mut self, inode: u32) -> Result<(), SqError>;
     /// Get directory entries
     fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>, SqError>;
+    /// Delete dentry. returns target inode.
+    fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32, SqError>;
     /// lookup a directory entry table and get a file attribute
     fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr, SqError>;
     /// Read data from whole block.
-    fn get_data(&self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>, SqError>;
+    fn get_data(&mut self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>, SqError>;
     /// Write data into whole block.
-    fn write_data(&self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<(), SqError>;
+    fn write_data(&mut self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<(), SqError>;
     /// Release all data related to inode
     fn release_data(&self, inode: u32) -> Result<(), SqError>;
     /// Get block size of filesystem

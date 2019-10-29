@@ -1,14 +1,25 @@
 use fuse::{
-    Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyWrite, Request,
+    Filesystem,
+    ReplyAttr,
+    ReplyData,
+    ReplyDirectory,
+    ReplyEntry,
+    ReplyWrite,
+    ReplyCreate,
+    ReplyEmpty,
+    Request,
+    FileType
 };
 use libc::ENOENT;
 use std::path::Path;
 use std::ffi::OsStr;
-use crate::db_module::DbModule;
+use crate::db_module::{DbModule, DBFileAttr};
 use crate::db_module::sqlite::Sqlite;
 use crate::sqerror::SqError;
 use time::Timespec;
 use std::time::SystemTime;
+use std::sync::Mutex;
+use std::collections::HashMap;
 
 const ONE_SEC: Timespec = Timespec{
     sec: 1,
@@ -17,6 +28,7 @@ const ONE_SEC: Timespec = Timespec{
 
 pub struct SqliteFs{
     db: Sqlite,
+    lookup_count: Mutex<HashMap<u32, u32>>
 }
 
 impl SqliteFs {
@@ -25,19 +37,51 @@ impl SqliteFs {
             Ok(n) => n,
             Err(err) => return Err(err)
         };
-        Ok(SqliteFs{db})
+        let lookup_count = Mutex::new(HashMap::<u32, u32>::new());
+        Ok(SqliteFs{db, lookup_count})
     }
 }
 
 impl Filesystem for SqliteFs {
+    fn destroy(&mut self, _req: &Request<'_>) {
+        let lc_list = self.lookup_count.lock().unwrap();
+        for key in lc_list.keys() {
+            match self.db.delete_inode_if_noref(*key) {
+                Ok(n) => n,
+                Err(err) => debug!("{}", err)
+            }
+        }
+    }
+
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        match self.db.lookup(parent as u32, name.to_str().unwrap()) {
+        let parent = parent as u32;
+        let child = match self.db.lookup(parent, name.to_str().unwrap()) {
             Ok(n) => {
                 reply.entry(&ONE_SEC, &n.get_file_attr() , 0);
                 debug!("filesystem:lookup, return:{:?}", n.get_file_attr());
+                n.ino
             },
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
+        let mut lc_list = self.lookup_count.lock().unwrap();
+        let lc = lc_list.entry(child).or_insert(0);
+        *lc += 1;
+        debug!("filesystem:lookup, lookup count:{:?}", *lc);
+    }
+
+    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
+        let ino = ino as u32;
+        let mut lc_list = self.lookup_count.lock().unwrap();
+        let lc = lc_list.entry(ino).or_insert(0);
+        *lc -= nlookup as u32;
+        debug!("filesystem:forget, lookup count:{:?}", *lc);
+        if *lc <= 0 {
+            lc_list.remove(&ino);
+            match self.db.delete_inode_if_noref(ino) {
+                Ok(n) => n,
+                Err(err) => debug!("{}", err)
+            }
+        }
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
@@ -85,6 +129,25 @@ impl Filesystem for SqliteFs {
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
         reply.attr(&ONE_SEC, &attr.get_file_attr());
+    }
+
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let ino = match self.db.delete_dentry(parent as u32, name.to_str().unwrap()) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+        let lc_list = self.lookup_count.lock().unwrap();
+        if !lc_list.contains_key(&ino) {
+            match self.db.delete_inode_if_noref(ino) {
+                Ok(n) => n,
+                Err(err) => {
+                    reply.error(ENOENT);
+                    debug!("{}", err);
+                    return;
+                }
+            };
+        }
+        reply.ok();
     }
 
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, reply: ReplyData) {
@@ -161,5 +224,35 @@ impl Filesystem for SqliteFs {
             debug!("filesystem:readdir, ino: {:?} offset: {:?} kind: {:?} name: {}", entry.child_ino as u64, (i + 1) as i64, entry.file_type, entry.filename);
         }
         reply.ok();
+    }
+
+    fn create(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _flags: u32, reply: ReplyCreate) {
+        let now = SystemTime::now();
+        let mut attr = DBFileAttr{
+            ino: 0,
+            size: 0,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            kind: FileType::RegularFile,
+            perm: mode as u16,
+            nlink: 0,
+            uid: req.uid(),
+            gid: req.gid(),
+            rdev: 0,
+            flags: 0
+        };
+        let ino = match self.db.add_inode(parent as u32, name.to_str().unwrap(), &attr) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+        attr.ino = ino;
+        let mut lc_list = self.lookup_count.lock().unwrap();
+        let lc = lc_list.entry(ino).or_insert(0);
+        *lc += 1;
+        debug!("filesystem:create, created:{:?}", attr);
+        reply.created(&ONE_SEC, &attr.get_file_attr(), 0, 0, 0);
     }
 }

@@ -295,7 +295,7 @@ pub trait Filesystem {
 この時、inodeの lookup count を1増やさなければならない(forgetで0に戻す)
 
 lookup count については、 `lib.rs` によると、
-「lookup count がある内は参照カウントが0になってもディレクトリエントリを削除しないでね」という話  
+「lookup count がある内は参照カウントが0になってもinodeを削除しないでね」という話  
 以降ReplyEntry と ReplyCreateがある全ての関数が呼ばれるたびに、1ずつ増やしていく。
 
 [forgetについての議論](http://fuse.996288.n3.nabble.com/forget-inodes-td9599.html)
