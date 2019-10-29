@@ -11,7 +11,7 @@ fn main() {
     env_logger::init();
     let mountpoint = env::args_os().nth(1).unwrap();
     let db_path = env::args_os().nth(2).unwrap();
-    let options = ["-o", "ro", "-o", "fsname=sqlitefs"]
+    let options = ["-o", "fsname=sqlitefs"]
         .iter()
         .map(|o| o.as_ref())
         .collect::<Vec<&OsStr>>();

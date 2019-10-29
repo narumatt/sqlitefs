@@ -3,16 +3,23 @@ use std::time::SystemTime;
 use crate::sqerror::SqError;
 use fuse::{FileAttr, FileType};
 use time::Timespec;
+use chrono::{DateTime, Utc, NaiveDateTime};
 
 pub trait DbModule {
     /// Get file metadata. If not found, return ino 0
     fn get_inode(&self, inode: u32) -> Result<DBFileAttr, SqError>;
+    /// Update file metadata.
+    fn update_inode(&self, attr: DBFileAttr) -> Result<(), SqError>;
     /// Get directory entries
     fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>, SqError>;
     /// lookup a directory entry table and get a file attribute
     fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr, SqError>;
-    /// Read data.
+    /// Read data from whole block.
     fn get_data(&self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>, SqError>;
+    /// Write data into whole block.
+    fn write_data(&self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<(), SqError>;
+    /// Release all data related to inode
+    fn release_data(&self, inode: u32) -> Result<(), SqError>;
     /// Get block size of filesystem
     fn get_db_block_size(&self) -> u32;
 }
@@ -59,6 +66,11 @@ impl DBFileAttr {
         } else {
             Timespec::new(0, 0)
         }
+    }
+
+    pub fn datetime_from(&self, ts: &Timespec) -> SystemTime {
+        let dt = DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(ts.sec, ts.nsec as u32), Utc);
+        SystemTime::from(dt)
     }
 
     pub fn get_file_attr(&self) -> FileAttr {

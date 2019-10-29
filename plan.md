@@ -1,5 +1,16 @@
 # plan
 
+## ロードマップ
+1. Hello
+1. ReadWrite
+1. create / delete file
+1. create / delete directory
+1. rename
+1. permissions
+1. rock operation
+1. extended attributes
+1. additional functions
+
 ## 参考リンク
 
 [rust-fuse](https://github.com/zargony/rust-fuse) : Rust版Fuseプロジェクト
@@ -41,13 +52,13 @@ pub struct FileAttr {
     /// Size in blocks Sparse File に対応する場合、実際に使用しているブロック数を返す
     pub blocks: u64,
     /// Time of last access read(2)実行時に更新される
-    pub atime: SystemTime,
+    pub atime: Timespec,
     /// Time of last modification write(2)またはtruncate(2)実行時に更新される
-    pub mtime: SystemTime,
+    pub mtime: Timespec,
     /// Time of last change メタデータ変更時に更新される。 write(2)またはtruncate(2)でファイル内容が変わるときも更新される
-    pub ctime: SystemTime,
+    pub ctime: Timespec,
     /// Time of creation (macOS only)
-    pub crtime: SystemTime,
+    pub crtime: Timespec,
     /// Kind of file (directory, file, pipe, etc)
     pub kind: FileType,
     /// Permissions
@@ -164,7 +175,7 @@ pub trait Filesystem {
     fn getattr(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyAttr) {
         reply.error(ENOSYS);
     }
-    fn setattr(&mut self, _req: &Request<'_>, _ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, _size: Option<u64>, _atime: Option<SystemTime>, _mtime: Option<SystemTime>, _fh: Option<u64>, _crtime: Option<SystemTime>, _chgtime: Option<SystemTime>, _bkuptime: Option<SystemTime>, _flags: Option<u32>, reply: ReplyAttr) {
+    fn setattr(&mut self, _req: &Request<'_>, _ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, _size: Option<u64>, _atime: Option<Timespec>, _mtime: Option<Timespec>, _fh: Option<u64>, _crtime: Option<Timespec>, _chgtime: Option<Timespec>, _bkuptime: Option<Timespec>, _flags: Option<u32>, reply: ReplyAttr) {
         reply.error(ENOSYS);
     }
     fn readlink(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyData) {
@@ -341,12 +352,12 @@ _mode: Option<u32>,
 _uid: Option<u32>,
 _gid: Option<u32>,
 _size: Option<u64>,
-_atime: Option<SystemTime>,
-_mtime: Option<SystemTime>,
+_atime: Option<Timespec>,
+_mtime: Option<Timespec>,
 _fh: Option<u64>,
-_crtime: Option<SystemTime>,
-_chgtime: Option<SystemTime>,
-_bkuptime: Option<SystemTime>
+_crtime: Option<Timespec>,
+_chgtime: Option<Timespec>,
+_bkuptime: Option<Timespec>
  _flags: Option<u32>`
 
 

@@ -99,8 +99,8 @@ impl Sqlite {
             metadata.flags,\
             blocknum.block_num \
             FROM metadata \
-            LEFT JOIN (SELECT count(block_num) block_num from data where file_id=$1) as blocknum
-            where id=$1";
+            LEFT JOIN (SELECT count(block_num) block_num FROM data WHERE file_id=$1) AS blocknum
+            WHERE id=$1";
         let connect: MutexGuard<Connection>;
         let stmt = match tx {
             Some(tx) => {
@@ -134,7 +134,6 @@ impl Sqlite {
         })
     }
 
-
     fn parse_attr(&self, mut stmt: Statement, params: &[&dyn ToSql]) -> Result<DBFileAttr, SqError> {
         let rows = stmt.query_map(params, |row| self.parse_attr_row(row))?;
         let mut attrs = Vec::new();
@@ -147,11 +146,107 @@ impl Sqlite {
             Ok(attrs[0])
         }
     }
+
+    fn update_time(&self, inode: u32, sql: &str, time: DateTime<Utc>, tx: Option<&Transaction>) -> Result<(), SqError> {
+        let connect: MutexGuard<Connection>;
+        let mut stmt = match tx {
+            Some(tx) => {
+                tx.prepare(sql)?
+            },
+            None => {
+                connect = self.conn.lock().unwrap();
+                connect.prepare(sql)?
+            }
+        };
+        let params = params![&time.format("%Y-%m-%d %H:%M:%S").to_string(), time.timestamp_subsec_nanos(), inode];
+        stmt.execute(params)?;
+        Ok(())
+    }
+
+    fn update_atime(&self, inode: u32, time: DateTime<Utc>, tx: Option<&Transaction>) -> Result<(), SqError> {
+        let sql = "UPDATE metadata SET atime=datetime($1), atime_nsec=$2 WHERE id=$3";
+        self.update_time(inode, sql, time, tx)
+    }
+
+    fn update_mtime(&self, inode: u32, time: DateTime<Utc>, tx: Option<&Transaction>) -> Result<(), SqError> {
+        let sql = "UPDATE metadata SET mtime=datetime($1), mtime_nsec=$2 WHERE id=$3";
+        self.update_time(inode, sql, time, tx)
+    }
+
+    fn update_ctime(&self, inode: u32, time: DateTime<Utc>, tx: Option<&Transaction>) -> Result<(), SqError> {
+        let sql = "UPDATE metadata SET ctime=datetime($1), ctime_nsec=$2 WHERE id=$3";
+        self.update_time(inode, sql, time, tx)
+    }
+
+    fn release_data_local(&self, inode: u32, tx: Option<&Transaction>) -> Result<(), SqError> {
+        let sql = "DELETE FROM data WHERE file_id=$1";
+        let connect: MutexGuard<Connection>;
+        let mut stmt = match tx {
+            Some(tx) => {
+                tx.prepare(sql)?
+            },
+            None => {
+                connect = self.conn.lock().unwrap();
+                connect.prepare(sql)?
+            }
+        };
+        stmt.execute(params![inode])?;
+        Ok(())
+    }
 }
 
 impl DbModule for Sqlite {
     fn get_inode(&self, inode: u32) -> Result<DBFileAttr, SqError> {
         self.get_inode_local(inode, None)
+    }
+
+    fn update_inode(&self, attr: DBFileAttr) -> Result<(), SqError> {
+        let sql = "UPDATE metadata SET \
+            size=$1,\
+            atime=datetime($2),\
+            atime_nsec=$3,\
+            mtime=datetime($4),\
+            mtime_nsec=$5,\
+            ctime=datetime($6),\
+            ctime_nsec=$7,\
+            crtime=datetime($8),\
+            crtime_nsec=$9,\
+            mode=$10,\
+            uid=$11,\
+            gid=$12,\
+            rdev=$13,\
+            flags=$14 \
+             WHERE id=$15";
+        let atime = DateTime::<Utc>::from(attr.atime);
+        let mtime = DateTime::<Utc>::from(attr.mtime);
+        let ctime = DateTime::<Utc>::from(attr.ctime);
+        let crtime = DateTime::<Utc>::from(attr.crtime);
+        let mut connect = self.conn.lock().unwrap();
+        let tx = connect.transaction()?;
+        {
+            let mut stmt = tx.prepare(sql)?;
+            stmt.execute(params![
+            attr.size,
+            atime.format("%Y-%m-%d %H:%M:%S").to_string(),
+            atime.timestamp_subsec_nanos(),
+            mtime.format("%Y-%m-%d %H:%M:%S").to_string(),
+            mtime.timestamp_subsec_nanos(),
+            ctime.format("%Y-%m-%d %H:%M:%S").to_string(),
+            ctime.timestamp_subsec_nanos(),
+            crtime.format("%Y-%m-%d %H:%M:%S").to_string(),
+            crtime.timestamp_subsec_nanos(),
+            attr.perm,
+            attr.uid,
+            attr.gid,
+            attr.rdev,
+            attr.flags,
+            attr.ino
+            ])?;
+        }
+        if attr.size == 0 {
+            self.release_data_local(attr.ino, Some(&tx))?;
+        }
+        Ok(())
     }
 
     fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>, SqError> {
@@ -197,7 +292,7 @@ impl DbModule for Sqlite {
             ON metadata.id=dentry.child_id \
             AND dentry.parent_id=$1 \
             AND dentry.name=$2 \
-            LEFT JOIN (SELECT file_id file_id, count(block_num) block_num from data) as blocknum \
+            LEFT JOIN (SELECT file_id file_id, count(block_num) block_num from data) AS blocknum \
             ON dentry.child_id = blocknum.file_id
             ";
         let connect = self.conn.lock().unwrap();
@@ -207,21 +302,53 @@ impl DbModule for Sqlite {
     }
 
     fn get_data(&self, inode:u32, block: u32, length: u32) -> Result<Vec<u8>, SqError> {
-        let connect = self.conn.lock().unwrap();
-        let mut stmt = connect.prepare(
-            "SELECT \
-                data FROM data where file_id=$1 and block_num=$2")?;
-        let row: Vec<u8> = match stmt.query_row(params![inode, block], |row| row.get(0)) {
-            Ok(n) => n,
-            Err(err) => {
-                if err == rusqlite::Error::QueryReturnedNoRows {
-                    vec![0; length as usize]
-                } else {
-                    return Err(SqError::from(err))
+        let mut connect = self.conn.lock().unwrap();
+        let tx = connect.transaction()?;
+        let row: Vec<u8>;
+        {
+            let mut stmt = tx.prepare(
+                "SELECT \
+                data FROM data WHERE file_id=$1 AND block_num=$2")?;
+            row = match stmt.query_row(params![inode, block], |row| row.get(0)) {
+                Ok(n) => n,
+                Err(err) => {
+                    if err == rusqlite::Error::QueryReturnedNoRows {
+                        vec![0; length as usize]
+                    } else {
+                        return Err(SqError::from(err))
+                    }
                 }
-            }
-        };
+            };
+        }
+        self.update_atime(inode, Utc::now(), Some(&tx))?;
+        tx.commit()?;
         Ok(row)
+    }
+
+    fn write_data(&self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<(), SqError> {
+        let mut connect = self.conn.lock().unwrap();
+        let tx = connect.transaction()?;
+        {
+            let db_size: u32 = tx.query_row("SELECT size FROM metadata WHERE id=$1", params![inode], |row| row.get(0))?;
+            tx.execute("REPLACE INTO data \
+            (file_id, block_num, data)
+            VALUES($1, $2, $3)",
+                       params![inode, block, data])?;
+            if size > db_size {
+                tx.execute("UPDATE metadata SET size=$1 WHERE id=$2", params![size, inode])?;
+            }
+        }
+        let time = Utc::now();
+        self.update_mtime(inode, time, Some(&tx))?;
+        self.update_ctime(inode, time, Some(&tx))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn release_data(&self, inode: u32) -> Result<(), SqError> {
+        let connect = self.conn.lock().unwrap();
+        connect.execute("DELETE FROM data WHERE file_id=$1", params![inode])?;
+        Ok(())
     }
 
     fn get_db_block_size(&self) -> u32 {

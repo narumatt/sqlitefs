@@ -2,23 +2,23 @@
 
 Filesystem in Userspace(FUSE) はユーザ空間でファイルシステムを実現する仕組みです。
 
-一般的にファイルシステムを作るというと、カーネルモジュールを作成しなければならないので、いろいろと苦労が多いですが、FUSEを使えば大分楽に実装できます。  
+一般的にファイルシステムを作るというと、カーネルモジュールを作成しなければならないのでいろいろと苦労が多いですが、FUSEを使えば大分楽に実装できます。  
 また、HDDなどの実デバイスに直接読み書きするだけでなく、仮想的なファイルシステムを作るのにも都合がよいです。
 
 そんな訳で、FUSEを使ったSSH as a filesystem や AWS S3 as a filesystemといった
 「読み書きできる何かをファイルシステムとしてマウント出来るようにするソフトウェア」があれこれと存在します。
 
-ただし、カーネルモジュールを作るより楽とはいえ、FUSEを使ったソフトウェアの作成には困難が伴います。  
-ある程度ファイルシステムの知識は必要ですし、チュートリアルはほどほどの所で終わってしまい、「あとはsshfsの実装などを見てくれ！」とコードの海に投げ出されます。
+ただし、カーネルモジュールを作るより楽とはいえ、FUSEを使ったソフトウェアを作成するのは大変です。  
+ある程度ファイルシステムの知識は必要ですし、チュートリアルを見てもほどほどの所で終わってしまい、「あとはsshfsの実装などを見てくれ！」とコードの海に投げ出されます。
 
 本書は、RustによるFUSEインターフェースの実装である `rust-fuse` を用いてFUSEを使ったファイルシステムの実装に挑戦し、
 気をつけるべき点などを記録したものです。
 
 ## FUSEの仕組み(アバウト)
 
-FUSE本体はLinuxカーネルに付属するカーネルモジュールであり、大抵のディストリビューションではデフォルトでビルドされてインストールされます。
+FUSE本体はLinuxカーネルに付属するカーネルモジュールで、大抵のディストリビューションではデフォルトでビルドされてインストールされています。
 
-FUSEがマウントされたディレクトリ内のパスに対してシステムコールが呼ばれると、以下のように情報がやりとりされます。
+FUSEを使ったファイルシステムがマウントされたディレクトリ内に対してシステムコールが呼ばれると、以下のように情報がやりとりされます。
 
 ```
 システムコール <-> VFS <-> FUSE <-> FUSEインターフェース <-> 自分のプログラム
@@ -36,15 +36,15 @@ FUSEはデバイス `/dev/fuse` を持ち、ここを通じてユーザ空間と
 このlibfuseが大変強力なので、大抵の言語でのFUSEインターフェースはlibfuseのラッパーになっています。
 
 ## rust-fuse
-Rustには独自のFUSEインターフェースの実装 `Rust FUSE(rust-fuse)` があります。ありがたいですね。  
+Rustには(ほぼ)独自のFUSEインターフェースの実装 `Rust FUSE(rust-fuse)` があります。ありがたいですね。  
 元々プロトコルが同じなので、インターフェースの関数はlibfuseと大変似ています。そのため、何か困った時にはlibfuseの情報が流用できたりします。ありがたいですね。
 
 現時点(2019/10) の最新版は0.3.1で、2年ぐらい更新されていませんが、次バージョン(0.4.0)が開発中です。  
 0.3.1と0.4.0では日時関係の型が大幅に違うので注意してください。
 
 # データの保存先
-HDDの代わりになるデータの保存先を決めます。
-今回はsqliteを使用します。  
+今回自分でファイルシステムを実装していく上で、HDDの代わりになるデータの保存先としてsqliteを使用します。
+
 sqliteは可変長のバイナリデータを持てるので、そこにデータを書き込みます。
 DBなので、メタデータの読み書きも割と簡単にできるでしょう。
 
@@ -105,7 +105,7 @@ pub struct FileAttr {
 |ctime_nsec|int|ステータス変更時刻(小数点以下)|
 |crtime|text|作成時刻(mac用)|
 |crtime_nsec|int|作成時刻(小数点以下)|
-|kind|int|ファイル種別(ファイル:0o0100000, ディレクトリ:0o0040000とする)
+|kind|int|ファイル種別|
 |mode|int|パーミッション(ファイル種別含む)|
 |nlink|int|ハードリンク数|
 |uid|int|uid|
@@ -115,8 +115,11 @@ pub struct FileAttr {
 
 idをinteger primary keyにします。これがinode番号になります。
 
-kindはファイル種別です。 FUSEでは `stat(2)` 同様modeにファイル種別のビットも含まれていて、cのlibfuseでは `libc::S_IFREG` 等を用いて判別する必要がありますが、  
-rust-fuseではライブラリ側で上手いこと処理してくれています。
+kindはファイル種別です。 FUSEでは `stat(2)` 同様modeにファイル種別のビットも含まれていて、
+cのlibfuseでは `libc::S_IFMT` (該当ビットのマスク) `libc::S_IFREG` (通常ファイルを示すビット) 等を用いて
+`if((mode & S_IFMT) == S_IFREG)` のようにして判別する必要がありますが、  
+rust-fuseではライブラリ側で上手いこと処理してくれています。  
+`mknod` の引数で `mode` が渡ってくるので、 `mknod` を実装する場合のみ気をつける必要があります。
 
 ## BDT
 ブロックデータテーブル(BDT)のblobにデータを格納します。
@@ -158,7 +161,7 @@ BDTはファイルのinode, 何番目のブロックか、の列を持ちます�
 ## SQL
 テーブル作成SQLは次のようになります。
 
-```
+```sqlite
 PRAGMA foreign_keys=ON;
 BEGIN TRANSACTION;
 CREATE TABLE metadata(
@@ -243,7 +246,7 @@ open/closeする関数を実装せずにread関数やreaddir関数を実装し�
 
 ## DB関数
 データベースを読み書きする関数です。  
-今回作成した関数は以下の通り。
+今回作成した関数は以下になります。
 
 ```
 pub trait DbModule {
@@ -452,7 +455,7 @@ fn main() {
 ## hello用の初期データ登録
 以下のSQLを実行して、 `hello.txt` をファイルシステムに入れます。
 
-```sql
+```sqlite
 PRAGMA foreign_keys=ON;
 BEGIN TRANSACTION;
 INSERT INTO metadata VALUES(2,13,'1970-01-01 00:00:00',0,'1970-01-01 00:00:00',0,'1970-01-01 00:00:00',0,'1970-01-01 00:00:00',0,32768,33188,1,0,0,0,0);
@@ -473,7 +476,7 @@ Hello World!
 ```
 
 また、 `$ RUST_LOG=debug cargo run ~/mount` でビルドと実行( `~/mount` にマウントして、デバッグログを出力)ができます。  
-試しに `cat ~/mount/hello.txt` を実行すると、以下のようなログが出力されます。
+試しに `cat ~/mount/hello.txt` を実行すると、以下のようなログが出力されます。 `env_logger` のおかげで各関数に対する呼び出しが記録されています。
 
 ```
 [2019-10-25T10:43:27Z DEBUG fuse::request] INIT(2)   kernel: ABI 7.31, flags 0x3fffffb, max readahead 131072
@@ -487,3 +490,210 @@ Hello World!
 
 ファイルシステムは `fusermount -u [マウント先]` でアンマウントできます。アンマウントするとプログラムは終了します。  
 `Ctrl + c` 等でプログラムを終了した場合でもマウントしたままになっているので、かならず `fusermount` を実行してください。
+
+次回はファイルの読み書きができるようにします。
+
+# ReadWrite
+## 概要
+前回は、ファイルの読み込みができるファイルシステムを作成しました。
+今回は、それに加えてファイルの書き込みができるようにします。
+
+必要なのは以下の関数です。
+
+```
+fn write(&mut self, _req: &Request<'_>, _ino: u64, _fh: u64, _offset: i64, _data: &[u8], _flags: u32, reply: ReplyWrite) {
+    ...
+}
+
+fn setattr(&mut self, _req: &Request<'_>, _ino: u64, _mode: Option<u32>, _uid: Option<u32>, _gid: Option<u32>, _size: Option<u64>, _atime: Option<Timespec>, _mtime: Option<Timespec>, _fh: Option<u64>, _crtime: Option<Timespec>, _chgtime: Option<Timespec>, _bkuptime: Option<Timespec>, _flags: Option<u32>, reply: ReplyAttr) {
+    reply.error(ENOSYS);
+}
+```
+
+なお、以下では実装する関数と同名のシステムコールと区別をつけるために、 システムコールは `write(2)` のような表記をします。
+
+## DB関数
+今回追加したDB側の関数は以下になります。
+
+```
+    /// メタデータを更新する。
+    fn update_inode(&self, attr: DBFileAttr) -> Result<(), SqError>;
+    /// 1ブロック分のデータを書き込む
+    fn write_data(&self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<(), SqError>;
+```
+
+## write
+引数の `inode` で指定されたファイルに `data` で渡ってきたデータを書き込みます。
+
+`write(2)` のようなシステムコールを使う場合はファイルオフセットを意識する必要がありますが、
+fuseはカーネルがオフセットの管理をしてくれているので、 `pwrite(2)` 相当の関数を一つ実装するだけで済むようになっています。
+
+マウントオプションに `direct_io` が設定されていない場合、エラーを返す場合を除いて、writeはsizeで指定された数字をreplyで返さないといけません。
+
+引数の `fh` は `open` 時にファイルシステムが指定した値です。今回はまだopenを実装していないので、常に0になります。
+
+また、 `open` 時のフラグに `O_APPEND` が設定されている場合は適切に処理しなければなりません。
+
+### O_APPEND
+ライトバックキャッシュが有効か無効かの場合で動作が異なります。
+マウントオプションに `-o writeback` がある場合、ライトバックキャッシュが有効になっています。
+
+ライトバックキャッシュが無効の時、ファイルシステムは `O_APPEND` を検知して、
+全ての `write` の中で `offset` の値にかかわらずデータがファイル末尾に追記されるようにチェックします。
+
+ライトバックキャッシュが有効の時、 `offset` はカーネルが適切に設定してくれます。 `O_APPEND` は無視してください。
+
+実際には `O_APPEND` に対して適切に処理していないファイルシステムが多く、(今のところ)カーネルはどのような場合でも `offset` をきちんと設定してくれます。
+
+### ここまでのコード
+```
+fn write(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, data: &[u8], flags: u32, reply: ReplyWrite) {
+    let block_size = self.db.get_db_block_size();
+    let ino = ino as u32;
+    let size = data.len() as u32;
+    let offset = offset as u32;
+    let start_block = offset / block_size + 1;
+    let end_block = (offset + size - 1) / block_size + 1;
+    // 各ブロックに書き込む
+    for i in start_block..=end_block {
+        let mut block_data: Vec<u8> = Vec::with_capacity(block_size as usize);
+        let b_start_index = if i == start_block {offset % block_size} else {0};
+        let b_end_index = if i == end_block {(offset+size-1) % block_size +1} else {block_size};
+        let data_offset = (i - start_block) * block_size;
+
+        // 書き込みがブロック全体に及ばない場合、一度ブロックのデータを読み込んで隙間を埋める
+        if (b_start_index != 0) || (b_end_index != block_size) {
+            let mut data_pre = match self.db.get_data(ino, i, block_size) {
+                Ok(n) => n,
+                Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+            };
+            if data_pre.len() < block_size as usize {
+                data_pre.resize(block_size as usize, 0);
+            }
+            if b_start_index != 0 {
+                block_data.extend_from_slice(&data_pre[0..b_start_index as usize]);
+            }
+            block_data.extend_from_slice(&data[data_offset as usize..(data_offset + b_end_index - b_start_index) as usize]);
+            if b_end_index != block_size {
+                block_data.extend_from_slice(&data_pre[b_end_index as usize..block_size as usize]);
+            }
+        } else {
+            block_data.extend_from_slice(&data[data_offset as usize..(data_offset + block_size) as usize]);
+        }
+        // ここで書き込む
+        match self.db.write_data(ino, i, &block_data, (i-1) * block_size + b_end_index) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        }
+    }
+    reply.written(size);
+}
+```
+
+### 実行結果
+
+```
+$ echo "append" >> ~/mount/hello.txt
+$ cat ~/mount/hello.txt
+Hello world!
+append
+```
+
+
+```
+[2019-10-28T11:52:08Z DEBUG fuse::request] INIT(2)   kernel: ABI 7.31, flags 0x3fffffb, max readahead 131072
+[2019-10-28T11:52:08Z DEBUG fuse::request] INIT(2) response: ABI 7.8, flags 0x1, max readahead 131072, max write 16777216
+[2019-10-28T11:52:14Z DEBUG fuse::request] LOOKUP(4) parent 0x0000000000000001, name "hello.txt"
+[2019-10-28T11:52:14Z DEBUG fuse::request] OPEN(6) ino 0x0000000000000002, flags 0x8401
+[2019-10-28T11:52:14Z DEBUG fuse::request] FLUSH(8) ino 0x0000000000000002, fh 0, lock owner 9742156966771960265
+[2019-10-28T11:52:14Z DEBUG fuse::request] GETXATTR(10) ino 0x0000000000000002, name "security.capability", size 0
+[2019-10-28T11:52:14Z DEBUG fuse::request] WRITE(12) ino 0x0000000000000002, fh 0, offset 13, size 7, flags 0x0
+[2019-10-28T11:52:14Z DEBUG fuse::request] RELEASE(14) ino 0x0000000000000002, fh 0, flags 0x8401, release flags 0x0, lock owner 0
+```
+
+
+## read, write時のメタデータの更新
+一般的にファイルを `read` した時にはメタデータの `atime` を更新します。  
+また、 `write` した時には、 `size` (必要な場合) `mtime` `ctime` の3つを更新します。  
+DB関数側でこれらを更新できるようにしておきます。
+
+マウントオプションで `-o noatime` が指定された場合、 `atime` の更新は行いません。
+
+## setattr
+`write` は実装しましたが、このままでは追記しかできません。  
+ファイルを丸ごと更新するために、ファイルサイズを0にする(truncateに相当) 処理を実装します。
+
+rust-fuseでは、 `setattr` を実装する事でファイルサイズの変更が可能になります。
+
+`setattr` は引数に `Option` で値が指定されるので、中身がある場合はその値で更新していきます。  
+`reply` に入れる値は、更新後のメタデータです。
+
+なお、 `ctime` は `setattr` 実行時に更新される事が決まっているので、引数には入っていません。
+
+```
+fn setattr(
+    &mut self,
+    _req: &Request<'_>,
+    ino: u64,
+    mode: Option<u32>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    size: Option<u64>,
+    atime: Option<Timespec>,
+    mtime: Option<Timespec>,
+    _fh: Option<u64>,
+    crtime: Option<Timespec>,
+    _chgtime: Option<Timespec>,
+    _bkuptime: Option<Timespec>,
+    flags: Option<u32>,
+    reply: ReplyAttr
+) {
+    // 現在のメタデータを取得
+    let mut attr = match self.db.get_inode(ino as u32) {
+        Ok(n) => n,
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+    // 引数で上書き
+    if let Some(n) = mode {attr.perm = n as u16};
+    if let Some(n) = uid {attr.uid = n};
+    if let Some(n) = gid {attr.gid = n};
+    if let Some(n) = size {attr.size = n as u32};
+    if let Some(n) = atime {attr.atime = datetime_from_timespec(&n)};
+    if let Some(n) = mtime {attr.mtime = datetime_from_timespec(&n)};
+    attr.ctime = SystemTime::now();
+    if let Some(n) = crtime {attr.crtime = datetime_from_timespec(&n)};
+    if let Some(n) = flags {attr.flags = n};
+    // 更新
+    match self.db.update_inode(attr) {
+        Ok(_n) => (),
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+    reply.attr(&ONE_SEC, &attr.get_file_attr());
+}
+```
+
+実行結果は以下のようになります。
+
+```
+$ echo "Update hello world" > ~/mount/hello.txt
+$ cat ~/mount/hello.txt
+Update hello world
+```
+
+```
+[2019-10-28T12:08:10Z DEBUG fuse::request] INIT(2)   kernel: ABI 7.31, flags 0x3fffffb, max readahead 131072
+[2019-10-28T12:08:10Z DEBUG fuse::request] INIT(2) response: ABI 7.8, flags 0x1, max readahead 131072, max write 16777216
+[2019-10-28T12:08:37Z DEBUG fuse::request] LOOKUP(4) parent 0x0000000000000001, name "hello.txt"
+[2019-10-28T12:08:37Z DEBUG fuse::request] OPEN(6) ino 0x0000000000000002, flags 0x8001
+[2019-10-28T12:08:37Z DEBUG fuse::request] GETXATTR(8) ino 0x0000000000000002, name "security.capability", size 0
+[2019-10-28T12:08:37Z DEBUG fuse::request] SETATTR(10) ino 0x0000000000000002, valid 0x208
+[2019-10-28T12:08:37Z DEBUG fuse::request] FLUSH(12) ino 0x0000000000000002, fh 0, lock owner 17171727478964840688
+[2019-10-28T12:08:37Z DEBUG fuse::request] WRITE(14) ino 0x0000000000000002, fh 0, offset 0, size 19, flags 0x0
+[2019-10-28T12:08:37Z DEBUG fuse::request] RELEASE(16) ino 0x0000000000000002, fh 0, flags 0x8001, release flags 0x0, lock owner 0
+
+```
+
+これでファイルの書き込みができるようになりました。  
+次回は、ファイルの作成と削除を実装します。
+
+
