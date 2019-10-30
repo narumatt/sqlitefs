@@ -6,7 +6,7 @@ use time::Timespec;
 use chrono::{DateTime, Utc, NaiveDateTime};
 
 pub trait DbModule {
-    /// Get file metadata. If not found, return ino 0
+    /// Get file metadata. If not found, return an attribute which inode is 0
     fn get_inode(&self, inode: u32) -> Result<DBFileAttr, SqError>;
     /// Add file.
     fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32, SqError>;
@@ -18,7 +18,8 @@ pub trait DbModule {
     fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>, SqError>;
     /// Delete dentry. returns target inode.
     fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32, SqError>;
-    /// lookup a directory entry table and get a file attribute
+    /// lookup a directory entry table and get a file attribute.
+    /// If not found, return an attribute which inode is 0
     fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr, SqError>;
     /// Read data from whole block.
     fn get_data(&mut self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>, SqError>;
@@ -26,6 +27,8 @@ pub trait DbModule {
     fn write_data(&mut self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<(), SqError>;
     /// Release all data related to inode
     fn release_data(&self, inode: u32) -> Result<(), SqError>;
+    /// Delete all inode which nlink is 0.
+    fn delete_all_noref_inode(&mut self) -> Result<(), SqError>;
     /// Get block size of filesystem
     fn get_db_block_size(&self) -> u32;
 }

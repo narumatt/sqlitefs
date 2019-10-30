@@ -1,6 +1,6 @@
 # 概要
 
-Filesystem in Userspace(FUSE) はユーザ空間でファイルシステムを実現する仕組みです。
+Filesystem in Userspace(FUSE) はLinuxのユーザ空間でファイルシステムを実現する仕組みです。
 
 一般的にファイルシステムを作るというと、カーネルモジュールを作成しなければならないのでいろいろと苦労が多いですが、FUSEを使えば大分楽に実装できます。  
 また、HDDなどの実デバイスに直接読み書きするだけでなく、仮想的なファイルシステムを作るのにも都合がよいです。
@@ -119,13 +119,14 @@ idをinteger primary keyにします。これがinode番号になります。
 
 kindはファイル種別です。 FUSEでは `stat(2)` 同様modeにファイル種別のビットも含まれていて、
 cのlibfuseでは `libc::S_IFMT` (該当ビットのマスク) `libc::S_IFREG` (通常ファイルを示すビット) 等を用いて
-`if((mode & S_IFMT) == S_IFREG)` のようにして判別する必要がありますが、  
-rust-fuseではライブラリ側で上手いこと処理してくれています。  
-`mknod` の引数で `mode` が渡ってくるので、 `mknod` を実装する場合のみ気をつける必要があります。
+`if((mode & S_IFMT) == S_IFREG)` のようにして判別する事ができます。
+
+ファイル種別が問題になるのはメタデータを返す時ですが、rust-fuseではenumでファイル種別を定義しています。
+`mknod` の引数で `mode` が生の値で渡ってくるので、 `mknod` を実装する場合のみ気をつける必要があります。
 
 ## BDT
 ブロックデータテーブル(BDT)のblobにデータを格納します。
-BDTはファイルのinode, 何番目のブロックか、の列を持ちます。具体的には以下のようになります。
+BDTはファイルのinode番号, 何番目のブロックか、の列を持ちます。具体的には以下のようになります。
 
 |列名 | 型 | 概要|
 |---|---|---|
@@ -150,15 +151,15 @@ BDTはファイルのinode, 何番目のブロックか、の列を持ちます�
 
 |列名 | 型 | 概要|
 |---|---|---|
-|parent_id|int|親ディレクトリのinode (pkey)(foreign key)|
-|child_id|int|子ファイル/子ディレクトリのinode (foreign key)|
+|parent_id|int|親ディレクトリのinode番号 (pkey)(foreign key)|
+|child_id|int|子ファイル/子ディレクトリのinode番号 (foreign key)|
 |file_type|int|ファイルタイプ|
 |name|text|ファイル/ディレクトリ名 (pkey)|
 
 あらゆるディレクトリは `.` と `..` のエントリを持ちます。(ルートの `..` は `.` です。)  
 `.` と `..` は返さなくともよい事になっていますが、その場合は呼び出し側の責任で処理する事になります。
 
-ファイルタイプはメタデータとディレクトリエントリで2重に持っていますが、同じinodeに対してファイルタイプが変わることは無いのでよしとします。
+ファイルタイプはメタデータとディレクトリエントリで2重に持っていますが、ファイルタイプを変更する機能は無いのでよしとします。
 
 ## SQL
 テーブル作成SQLは次のようになります。
@@ -215,7 +216,7 @@ COMMIT;
 ```
 
 初期データとして、ルートディレクトリの情報を入れています。  
-FUSEでは、ルートディレクトリのinodeは1です。
+FUSEでは、ルートディレクトリのinode番号は1です。ルートディレクトリは必ず存在する必要があります。
 
 # Hello!
 ## 概要
@@ -254,11 +255,13 @@ open/closeする関数を実装せずにread関数やreaddir関数を実装し�
 pub trait DbModule {
     /// ファイルのメタデータを取得する。見つからない場合は0を返す
     fn get_inode(&self, inode: u32) -> Result<DBFileAttr, SqError>;
-    /// ディレクトリのinodeを指定して、ディレクトが持つディレクトリエントリを全て取得する
+    /// ディレクトリのinode番号を指定して、ディレクトが持つディレクトリエントリを全て取得する
     fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>, SqError>;
-    /// 親ディレクトリのinodeと名前から、ファイルやサブディレクトリのinodeとメタデータを得る
+    /// 親ディレクトリのinode番号と名前から、ファイルやサブディレクトリのinode番号とメタデータを得る
+    /// inodeが存在しない場合、inode番号が0の空のinodeを返す
     fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr, SqError>;
-    /// inodeとブロック数を指定して、1ブロック分のデータを読み込む
+    /// inode番号とブロック数を指定して、1ブロック分のデータを読み込む
+    /// ブロックデータが存在しない場合は、0(NULL)で埋められたブロックを返す
     fn get_data(&self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>, SqError>;
     /// DBのブロックサイズとして使っている値を得る
     fn get_db_block_size(&self) -> u32;
@@ -277,7 +280,7 @@ pub trait DbModule {
 `reply.ok()` `reply.error(ENOSYS)` `reply.attr(...)` 等 `reply` の型に応じたメソッドが使えます。
 
 ## lookup
-親ディレクトリのinode、当該ディレクトリ/ファイルの名前が与えられるので、ディレクトリエントリとメタデータを返します。  
+親ディレクトリのinode番号、当該ディレクトリ/ファイルの名前が与えられるので、ディレクトリエントリとメタデータを返します。  
 lookup実行時には `lookup count` をファイルシステム側で用意して、増やしたりしなければなりませんが、今回はreadonlyのファイルシステムなので無視します。  
 `lookup count` についてはunlink実装時に説明します。
 
@@ -329,7 +332,7 @@ fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntr
 ```
 
 ## getattr
-引数のinodeで指定されたファイルのメタデータを返します。
+引数のinode番号で指定されたファイルのメタデータを返します。
 内容については `lookup` で返す `ATTR` と同じです。
 
 ```
@@ -345,12 +348,12 @@ fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
 ```
 
 ## read
-引数のinodeで指定されたファイルをoffsetバイト目からsizeバイト分読み込みます。  
+引数のinode番号で指定されたファイルをoffsetバイト目からsizeバイト分読み込みます。  
 読み込んだデータは `reply.data(&data)` を実行して返します。
 
 ファイルの読み込む位置を指定する方法は色々とありますが、fuseは `pread(2)` 相当の関数を一つ実装するだけで済むようにしてくれています。
 
-EOFまたはエラーを返す場合を除いて、readはsizeで指定されたサイズのデータを返さないといけません。実データが足りなくて返せない場合は0埋めします。  
+EOFまたはエラーを返す場合を除いて、readはsizeで指定されたサイズのデータを返さないといけません。実データが足りなくて返せない場合は0(¥0)埋めします。  
 例えば、長さ200byteのデータに対して、4096byteの要求が来ることがあるので、3896byte分を0埋めして返さなければなりません。  
 例外として、`direct_io` フラグを `open` の戻り値として指定した場合、カーネルは `read(2)` システムコールの戻り値として、
 ファイルシステムの戻り値を直接使うので、sizeより小さいデータを返してもよいです。
@@ -496,6 +499,8 @@ Hello World!
 ファイルシステムは `fusermount -u [マウント先]` でアンマウントできます。アンマウントするとプログラムは終了します。  
 `Ctrl + c` 等でプログラムを終了した場合でもマウントしたままになっているので、かならず `fusermount` を実行してください。
 
+## まとめ
+Readonlyのファイルシステムが作成できました。  
 次回はファイルの読み書きができるようにします。
 
 # ReadWrite
@@ -521,7 +526,7 @@ fn setattr(&mut self, _req: &Request<'_>, _ino: u64, _mode: Option<u32>, _uid: O
 今回追加したDB側の関数は以下になります。
 
 ```
-    /// メタデータを更新する。
+    /// inodeのメタデータを更新する。
     fn update_inode(&self, attr: DBFileAttr) -> Result<(), SqError>;
     /// 1ブロック分のデータを書き込む
     fn write_data(&self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<(), SqError>;
@@ -632,6 +637,10 @@ append
 また、 `write` した時には、 `size` (必要な場合) `mtime` `ctime` の3つを更新します。  
 DB関数側でこれらを更新できるようにしておきます。
 
+特にファイルサイズは、追記などで書き込まれたデータの末尾が既存のファイルサイズより後になる場合は必ず更新する必要があります。  
+また、書き込みのオフセットにファイルサイズより大きい値が指定された場合、ファイルに何も書かれていない穴ができます。
+このエリアのデータが読まれた場合、ファイルシステムは0(NULLバイト)の列を返します。
+
 マウントオプションで `-o noatime` が指定された場合、 `atime` の更新は行いません。
 
 ## setattr
@@ -643,7 +652,7 @@ rust-fuseでは、 `setattr` を実装する事でファイルサイズの変更
 `setattr` は引数に `Option` で値が指定されるので、中身がある場合はその値で更新していきます。  
 `reply` に入れる値は、更新後のメタデータです。
 
-なお、 `ctime` は `setattr` 実行時に更新される事が決まっているので、引数には入っていません。
+なお、 `ctime` は 現在のrust-fuseがプロトコルのバージョンの問題で未対応なので、引数には入っていません。
 
 ```
 fn setattr(
@@ -708,6 +717,7 @@ Update hello world
 
 ```
 
+## まとめ
 これでファイルの書き込みができるようになりました。  
 次回は、ファイルの作成と削除を実装します。
 
@@ -717,20 +727,23 @@ Update hello world
 必要なのは以下の関数です。
 
 ```
+fn init(&mut self, _req: &Request<'_>) -> Result<(), c_int> {
+    ...
+}
 fn destroy(&mut self, _req: &Request<'_>) {
     ...
 }
 fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry){
-    ...
+    ...(追加)
 }
 fn forget(&mut self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {
     ...
 }
 fn unlink(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
-    reply.error(ENOSYS);
+    ...
 }
 fn create(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, _mode: u32, _flags: u32, reply: ReplyCreate) {
-    reply.error(ENOSYS);
+    ...
 }
 ```
 
@@ -743,6 +756,8 @@ lookup countは最初は0で、ReplyEntryとReplyCreateがある全ての関数�
 具体的には、 `lookup`, `mknod`, `mkdir`, `symlink`, `link`, `create` です。
 
 `forget` はlookup countを減らす関数です。 `forget` でlookup countが0になるまでは、削除を遅らせます。  
+カーネルは、まだファイルをOpenしているプロセスがあると、 `forget` をファイルが閉じられるまで遅延させます。  
+これにより、「別の誰かがファイルを削除したが、削除前からファイルを開いていた場合は読み込み続ける事ができる」というアレが実現できます。
 
 lookup countを実装するために、ファイルシステムの構造体に次の変数を追加します。
 
@@ -755,3 +770,258 @@ pub struct SqliteFs{
 }
 ```
 
+keyがinode番号、valueがlookup count、であるHashMapを作成します。
+
+## 追加したDB関数
+今回は以下のようなDB関数を追加しました。
+
+```
+/// inodeを追加する
+fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32, SqError>;
+/// inodeをチェックし、参照カウントが0なら削除する
+fn delete_inode_if_noref(&mut self, inode: u32) -> Result<(), SqError>;
+/// 親ディレクトリのinode番号、ファイル/ディレクトリ名で指定されたディレクトリエントリを削除し、
+/// 該当のinodeの参照カウントを1減らす
+/// inode番号を返す
+fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32, SqError>;
+/// 参照カウントが0である全てのinodeを削除する
+fn delete_all_noref_inode(&mut self) -> Result<(), SqError>;
+```
+
+## lookup
+`lookup` 関数を更新します。  
+関数が実行されるたびに、lookupで情報を持ってくる対象のファイル/ディレクトリのlookup countに1を足すようにします。
+
+コードは以下のようになります。
+
+```
+fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    // 既存のコード
+    let parent = parent as u32;
+    let child = match self.db.lookup(parent, name.to_str().unwrap()) {
+        Ok(n) => {
+            if n.ino == 0 {
+                reply.error(ENOENT);
+                return;
+            }
+            reply.entry(&ONE_SEC, &n.get_file_attr() , 0);
+            n.ino
+        },
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+
+    // lookup countに1を足す。HashMapにkeyが無い場合は追加する
+    let mut lc_list = self.lookup_count.lock().unwrap();
+    let lc = lc_list.entry(child).or_insert(0);
+    *lc += 1;
+}
+```
+
+## create
+ファイルを作成します。
+
+`creat(2)`または `O_CREAT` を指定した `open(2)` 実行時に呼ばれます。
+
+指定されたファイルが存在しない場合、引数の `mode` で指定されたモードでファイルを作成し、ファイルを開きます。  
+作成したユーザ、グループは、引数の `req` から `req.uid()` `req.gid()` で取得できます。
+ファイルが既に存在する場合、openと同じ動作を行います。  
+`open` と同じ動作のため、open時のフラグが `flags` で渡されます。その他処理は `open` と同じです。
+
+`create` が実装されていない場合、カーネルは `mknod` と `open` を実行します。
+
+なお、`create` が実装されている場合、libfuseは通常ファイルの `mknod` が実行されると `create` を呼び出しますが、
+rust-fuseは呼び出してくれないです。
+
+実装したコードは以下のようになります。
+
+```
+fn create(
+    &mut self,
+    req: &Request<'_>,
+    parent: u64,
+    name: &OsStr,
+    mode: u32,
+    _flags: u32,
+    reply: ReplyCreate
+) {
+    let ino;
+    let parent = parent as u32;
+    let name = name.to_str().unwrap();
+    // ファイルが既にあるかチェックする
+    let mut attr = match self.db.lookup(parent, name) {
+        Ok(n) => n,
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+    if attr.ino == 0 {
+        // ファイル作成
+        let now = SystemTime::now();
+        attr = DBFileAttr {
+            ino: 0,
+            size: 0,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            kind: FileType::RegularFile,
+            perm: mode as u16,
+            nlink: 0,
+            uid: req.uid(),
+            gid: req.gid(),
+            rdev: 0,
+            flags: 0
+        };
+        ino = match self.db.add_inode(parent, name, &attr) {
+            Ok(n) => n,
+            Err(err) => {
+                reply.error(ENOENT);
+                debug!("{}", err);
+                return;
+            }
+        };
+        attr.ino = ino;
+    } else {
+        ino = attr.ino;
+    }
+    // createもlookup countを+1する
+    let mut lc_list = self.lookup_count.lock().unwrap();
+    let lc = lc_list.entry(ino).or_insert(0);
+    *lc += 1;
+    reply.created(&ONE_SEC, &attr.get_file_attr(), 0, 0, 0);
+}
+```
+
+## unlink
+親ディレクトリのinode番号 `parent`, ファイル/ディレクトリ名 `name` が引数で指定されるので、
+ファイルまたはディレクトリを削除します。
+
+削除対象はディレクトリエントリと、該当のinodeのメタデータです。
+inodeはハードリンクされている可能性があるので、参照カウント( `nlink` ) を1減らし、0になった場合に削除します。  
+また、 lookup count をチェックし、0になっていない場合は削除を行いません。
+
+```
+fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    // ディレクトリエントリを削除しつつ、対象のinode番号を得る
+    let ino = match self.db.delete_dentry(parent as u32, name.to_str().unwrap()) {
+        Ok(n) => n,
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+    // lookup countのチェック
+    let lc_list = self.lookup_count.lock().unwrap();
+    if !lc_list.contains_key(&ino) {
+        リンクカウントが0の場合削除する
+        match self.db.delete_inode_if_noref(ino) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+    }
+    reply.ok();
+}
+```
+
+## forget
+lookup countを忘れます。
+
+引数の `ino` で対象のinode番号、 `nlookup` で減らす数が指定されます。  
+
+```
+fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
+    let ino = ino as u32;
+    // lookup countのチェック
+    let mut lc_list = self.lookup_count.lock().unwrap();
+    let lc = lc_list.entry(ino).or_insert(0);
+    *lc -= nlookup as u32;
+    if *lc <= 0 {
+        // 0(以下)になった場合、lookup countの一覧から削除する
+        lc_list.remove(&ino);
+        // 参照カウントが0でinodeの削除が遅延されていた場合、改めて削除する
+        match self.db.delete_inode_if_noref(ino) {
+            Ok(n) => n,
+            Err(err) => debug!("{}", err)
+        }
+    }
+}
+```
+
+## destroy
+ファイルシステムの終了時に呼ばれる関数です。
+
+ファイルシステムのアンマウント時には、全ての lookup count が0になる事が期待されます。  
+一方、 `forget` が呼ばれる事は保証されていないので、ファイルシステムが自分でチェックする必要があります。
+
+```
+fn destroy(&mut self, _req: &Request<'_>) {
+    let lc_list = self.lookup_count.lock().unwrap();
+    // lookup countが残っている全てのinodeをチェック
+    for key in lc_list.keys() {
+        // 参照カウントが0でinodeの削除が遅延されていた場合、改めて削除する
+        match self.db.delete_inode_if_noref(*key) {
+            Ok(n) => n,
+            Err(err) => debug!("{}", err)
+        }
+    }
+}
+```
+
+## init
+ファイルシステムのマウント時に最初に呼ばれる関数です。
+
+何らかの事情で `destroy` が呼ばれずにファイルシステムが終了した場合、参照カウントが0のままのinodeが残り続ける事になるので、
+チェックして削除します。
+
+```
+fn init(&mut self, _req: &Request<'_>) -> Result<(), c_int> {
+    match self.db.delete_all_noref_inode() {
+        Ok(n) => n,
+        Err(err) => debug!("{}", err)
+    };
+    Ok(())
+}
+```
+
+## 実行結果
+### ファイル作成
+
+```
+$ touch ~/mount/touch.txt
+$ echo "created" > ~/mount/test.txt
+$ ls ~/mount
+hello.txt  test.txt  touch.txt
+$ cat ~/mount/test.txt
+created
+```
+
+```
+[2019-10-30T11:21:59Z DEBUG fuse::request] INIT(2)   kernel: ABI 7.31, flags 0x3fffffb, max readahead 131072
+[2019-10-30T11:21:59Z DEBUG fuse::request] INIT(2) response: ABI 7.8, flags 0x1, max readahead 131072, max write 16777216
+[2019-10-30T11:22:14Z DEBUG fuse::request] LOOKUP(4) parent 0x0000000000000001, name "touch.txt"
+[2019-10-30T11:22:14Z DEBUG fuse::request] CREATE(6) parent 0x0000000000000001, name "touch.txt", mode 0o100664, flags 0x8841
+[2019-10-30T11:22:14Z DEBUG fuse::request] FLUSH(8) ino 0x0000000000000003, fh 0, lock owner 16194556409419452441
+[2019-10-30T11:22:14Z DEBUG fuse::request] SETATTR(10) ino 0x0000000000000003, valid 0x1b0
+[2019-10-30T11:22:14Z DEBUG fuse::request] RELEASE(12) ino 0x0000000000000003, fh 0, flags 0x8801, release flags 0x0, lock owner 0
+[2019-10-30T11:22:28Z DEBUG fuse::request] LOOKUP(14) parent 0x0000000000000001, name "test.txt"
+[2019-10-30T11:22:28Z DEBUG fuse::request] CREATE(16) parent 0x0000000000000001, name "test.txt", mode 0o100664, flags 0x8241
+[2019-10-30T11:22:29Z DEBUG fuse::request] GETXATTR(18) ino 0x0000000000000004, name "security.capability", size 0
+[2019-10-30T11:22:29Z DEBUG fuse::request] WRITE(20) ino 0x0000000000000004, fh 0, offset 0, size 8, flags 0x0
+[2019-10-30T11:22:29Z DEBUG fuse::request] RELEASE(22) ino 0x0000000000000004, fh 0, flags 0x8001, release flags 0x0, lock owner 0
+```
+
+### ファイル削除
+
+```
+$ rm ~/mount/test.txt
+$ ls ~/mount/test.txt
+ls: cannot access '/home/jiro/mount/test.txt': No such file or directory
+```
+
+
+```
+[2019-10-30T05:32:26Z DEBUG fuse::request] LOOKUP(48) parent 0x0000000000000001, name "test.txt"
+[2019-10-30T05:32:26Z DEBUG fuse::request] ACCESS(50) ino 0x0000000000000004, mask 0o002
+[2019-10-30T05:32:26Z DEBUG fuse::request] UNLINK(52) parent 0x0000000000000001, name "test.txt"
+[2019-10-30T05:32:26Z DEBUG fuse::request] FORGET(54) ino 0x0000000000000004, nlookup 4
+```
+
+## まとめ
+ファイルの作成、削除が問題なくできるようになりました。  
+次回は、ディレクトリの作成/削除ができるようにします。

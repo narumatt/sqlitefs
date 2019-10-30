@@ -10,7 +10,7 @@ use fuse::{
     Request,
     FileType
 };
-use libc::ENOENT;
+use libc::{c_int, ENOENT};
 use std::path::Path;
 use std::ffi::OsStr;
 use crate::db_module::{DbModule, DBFileAttr};
@@ -43,6 +43,14 @@ impl SqliteFs {
 }
 
 impl Filesystem for SqliteFs {
+    fn init(&mut self, _req: &Request<'_>) -> Result<(), c_int> {
+        match self.db.delete_all_noref_inode() {
+            Ok(n) => n,
+            Err(err) => debug!("{}", err)
+        };
+        Ok(())
+    }
+
     fn destroy(&mut self, _req: &Request<'_>) {
         let lc_list = self.lookup_count.lock().unwrap();
         for key in lc_list.keys() {
@@ -57,8 +65,12 @@ impl Filesystem for SqliteFs {
         let parent = parent as u32;
         let child = match self.db.lookup(parent, name.to_str().unwrap()) {
             Ok(n) => {
-                reply.entry(&ONE_SEC, &n.get_file_attr() , 0);
                 debug!("filesystem:lookup, return:{:?}", n.get_file_attr());
+                if n.ino == 0 {
+                    reply.error(ENOENT);
+                    return;
+                }
+                reply.entry(&ONE_SEC, &n.get_file_attr() , 0);
                 n.ino
             },
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
@@ -227,32 +239,48 @@ impl Filesystem for SqliteFs {
     }
 
     fn create(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _flags: u32, reply: ReplyCreate) {
-        let now = SystemTime::now();
-        let mut attr = DBFileAttr{
-            ino: 0,
-            size: 0,
-            blocks: 0,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
-            kind: FileType::RegularFile,
-            perm: mode as u16,
-            nlink: 0,
-            uid: req.uid(),
-            gid: req.gid(),
-            rdev: 0,
-            flags: 0
-        };
-        let ino = match self.db.add_inode(parent as u32, name.to_str().unwrap(), &attr) {
+        let ino;
+        let parent = parent as u32;
+        let name = name.to_str().unwrap();
+        let mut attr = match self.db.lookup(parent, name) {
             Ok(n) => n,
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
-        attr.ino = ino;
+        if attr.ino == 0 {
+            let now = SystemTime::now();
+            attr = DBFileAttr {
+                ino: 0,
+                size: 0,
+                blocks: 0,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                crtime: now,
+                kind: FileType::RegularFile,
+                perm: mode as u16,
+                nlink: 0,
+                uid: req.uid(),
+                gid: req.gid(),
+                rdev: 0,
+                flags: 0
+            };
+            ino = match self.db.add_inode(parent, name, &attr) {
+                Ok(n) => n,
+                Err(err) => {
+                    reply.error(ENOENT);
+                    debug!("{}", err);
+                    return;
+                }
+            };
+            attr.ino = ino;
+            debug!("filesystem:create, created:{:?}", attr);
+        } else {
+            ino = attr.ino;
+            debug!("filesystem:create, existed:{:?}", attr);
+        }
         let mut lc_list = self.lookup_count.lock().unwrap();
         let lc = lc_list.entry(ino).or_insert(0);
         *lc += 1;
-        debug!("filesystem:create, created:{:?}", attr);
         reply.created(&ONE_SEC, &attr.get_file_attr(), 0, 0, 0);
     }
 }

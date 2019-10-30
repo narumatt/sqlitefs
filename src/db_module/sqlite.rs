@@ -441,6 +441,11 @@ impl DbModule for Sqlite {
         Ok(())
     }
 
+    fn delete_all_noref_inode(&mut self) -> Result<(), SqError> {
+        self.conn.execute("DELETE FROM metadata WHERE nlink=0", params![])?;
+        Ok(())
+    }
+
     fn get_db_block_size(&self) -> u32 {
         BLOCK_SIZE
     }
