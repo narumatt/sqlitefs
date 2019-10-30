@@ -10,7 +10,7 @@ use fuse::{
     Request,
     FileType
 };
-use libc::{c_int, ENOENT};
+use libc::{c_int, ENOENT, ENOTEMPTY};
 use std::path::Path;
 use std::ffi::OsStr;
 use crate::db_module::{DbModule, DBFileAttr};
@@ -127,6 +127,7 @@ impl Filesystem for SqliteFs {
             Ok(n) => n,
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
+        let old_size = attr.size;
         if let Some(n) = mode {attr.perm = n as u16};
         if let Some(n) = uid {attr.uid = n};
         if let Some(n) = gid {attr.gid = n};
@@ -136,15 +137,74 @@ impl Filesystem for SqliteFs {
         attr.ctime = SystemTime::now();
         if let Some(n) = crtime {attr.crtime = attr.datetime_from(&n)};
         if let Some(n) = flags {attr.flags = n};
-        match self.db.update_inode(attr) {
+        match self.db.update_inode(attr, old_size < attr.size) {
             Ok(_n) => (),
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
         reply.attr(&ONE_SEC, &attr.get_file_attr());
     }
 
+    fn mkdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, reply: ReplyEntry) {
+        let now = SystemTime::now();
+        let mut attr = DBFileAttr {
+            ino: 0,
+            size: 0,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            kind: FileType::Directory,
+            perm: mode as u16,
+            nlink: 0,
+            uid: req.uid(),
+            gid: req.gid(),
+            rdev: 0,
+            flags: 0
+        };
+        let ino =  match self.db.add_inode(parent as u32, name.to_str().unwrap(), &attr) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+        attr.ino = ino;
+        reply.entry(&ONE_SEC, &attr.get_file_attr(), 0);
+    }
+
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let ino = match self.db.delete_dentry(parent as u32, name.to_str().unwrap()) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+        let lc_list = self.lookup_count.lock().unwrap();
+        if !lc_list.contains_key(&ino) {
+            match self.db.delete_inode_if_noref(ino) {
+                Ok(n) => n,
+                Err(err) => {
+                    reply.error(ENOENT);
+                    debug!("{}", err);
+                    return;
+                }
+            };
+        }
+        reply.ok();
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let parent = parent as u32;
+        let name = name.to_str().unwrap();
+        let attr = match self.db.lookup(parent, name) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+        let empty = match self.db.check_directory_is_empty(attr.ino){
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+        if !empty {
+            reply.error(ENOTEMPTY);
+            return;
+        }
+        let ino = match self.db.delete_dentry(parent, name) {
             Ok(n) => n,
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };

@@ -6,10 +6,11 @@
 1. create / delete file
 1. create / delete directory
 1. rename
+1. additional functions and errors
 1. permissions
 1. rock operation
 1. extended attributes
-1. additional functions
+
 
 ## 参考リンク
 

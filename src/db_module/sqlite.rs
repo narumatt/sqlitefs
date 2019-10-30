@@ -65,10 +65,33 @@ fn const_to_file_type(kind: u32) -> FileType {
     }
 }
 
-fn release_data_tx(inode: u32, tx: &Connection) -> Result<(), SqError> {
-    let sql = "DELETE FROM data WHERE file_id=$1";
-    let mut stmt =  tx.prepare(sql)?;
-    stmt.execute(params![inode])?;
+fn release_data(inode: u32, offset: u32, tx: &Connection) -> Result<(), SqError> {
+    if offset == 0 {
+        tx.execute("DELETE FROM data WHERE file_id=$1", params![inode])?;
+    } else {
+        let mut block = offset / BLOCK_SIZE;
+        if offset % BLOCK_SIZE != 0 {
+            block = offset / BLOCK_SIZE + 1;
+            let sql = "SELECT data FROM data WHERE file_id=$1 and block_num = $2";
+            let mut stmt = tx.prepare(sql)?;
+            let mut data: Vec<u8> = match stmt.query_row(params![inode, block], |row| row.get(0)) {
+                Ok(n) => n,
+                Err(err) => {
+                    if err == rusqlite::Error::QueryReturnedNoRows {
+                        vec![0; BLOCK_SIZE as usize]
+                    } else {
+                        return Err(SqError::from(err))
+                    }
+                }
+            };
+            data.resize((offset % BLOCK_SIZE) as usize, 0);
+            tx.execute("REPLACE INTO data \
+            (file_id, block_num, data)
+            VALUES($1, $2, $3)",
+                       params![inode, block, data])?;
+        }
+        tx.execute("DELETE FROM data WHERE file_id=$1 and block_num > $2", params![inode, block])?;
+    }
     Ok(())
 }
 
@@ -258,11 +281,17 @@ impl DbModule for Sqlite {
         let dentry = DEntry{parent_ino: parent, child_ino: child, filename: String::from(name), file_type: attr.kind};
         add_dentry(dentry, &tx)?;
         inclease_nlink(child, &tx)?;
+        if attr.kind == FileType::Directory {
+            let dentry = DEntry{parent_ino: child, child_ino: parent, filename: String::from(".."), file_type: attr.kind};
+            add_dentry(dentry, &tx)?;
+            let dentry = DEntry{parent_ino: child, child_ino: child, filename: String::from("."), file_type: attr.kind};
+            add_dentry(dentry, &tx)?;
+        }
         tx.commit()?;
         Ok(child)
     }
 
-    fn update_inode(&mut self, attr: DBFileAttr) -> Result<(), SqError> {
+    fn update_inode(&mut self, attr: DBFileAttr, truncate: bool) -> Result<(), SqError> {
         let sql = "UPDATE metadata SET \
             size=$1,\
             atime=datetime($2),\
@@ -304,8 +333,8 @@ impl DbModule for Sqlite {
             attr.ino
             ])?;
         }
-        if attr.size == 0 {
-            release_data_tx(attr.ino, &tx)?;
+        if truncate {
+            release_data(attr.ino, attr.size, &tx)?;
         }
         tx.commit()?;
         Ok(())
@@ -359,6 +388,21 @@ impl DbModule for Sqlite {
         declease_nlink(child, &tx)?;
         tx.commit()?;
         Ok(child)
+    }
+
+    fn check_directory_is_empty(&self, inode: u32) -> Result<bool, SqError> {
+        let sql = "SELECT name FROM dentry where parent_id=$1";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![inode], |row| {
+            Ok({let name: String; name=row.get(0)?; name})
+        })?;
+        for row in rows {
+            let name = row?;
+            if &name != "." && &name != ".." {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr, SqError> {
