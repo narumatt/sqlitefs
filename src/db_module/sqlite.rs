@@ -4,7 +4,7 @@ use chrono::{Utc, DateTime, NaiveDateTime, Timelike};
 use rusqlite::types::ToSql;
 use rusqlite::{params, Connection, NO_PARAMS, Statement};
 use crate::db_module::{DbModule, DBFileAttr, DEntry};
-use crate::sqerror::SqError;
+use crate::sqerror::{Error, Result, ErrorKind};
 use fuse::FileType;
 
 const DB_IFIFO: u32 = 0o0010000;
@@ -65,7 +65,7 @@ fn const_to_file_type(kind: u32) -> FileType {
     }
 }
 
-fn release_data(inode: u32, offset: u32, tx: &Connection) -> Result<(), SqError> {
+fn release_data(inode: u32, offset: u32, tx: &Connection) -> Result<()> {
     if offset == 0 {
         tx.execute("DELETE FROM data WHERE file_id=$1", params![inode])?;
     } else {
@@ -80,7 +80,7 @@ fn release_data(inode: u32, offset: u32, tx: &Connection) -> Result<(), SqError>
                     if err == rusqlite::Error::QueryReturnedNoRows {
                         vec![0; BLOCK_SIZE as usize]
                     } else {
-                        return Err(SqError::from(err))
+                        return Err(Error::from(err))
                     }
                 }
             };
@@ -95,29 +95,29 @@ fn release_data(inode: u32, offset: u32, tx: &Connection) -> Result<(), SqError>
     Ok(())
 }
 
-fn update_time(inode: u32, sql: &str, time: DateTime<Utc>, tx: &Connection) -> Result<(), SqError> {
+fn update_time(inode: u32, sql: &str, time: DateTime<Utc>, tx: &Connection) -> Result<()> {
     let mut stmt = tx.prepare(sql)?;
     let params = params![&time.format("%Y-%m-%d %H:%M:%S").to_string(), time.timestamp_subsec_nanos(), inode];
     stmt.execute(params)?;
     Ok(())
 }
 
-fn update_atime(inode: u32, time: DateTime<Utc>, tx: &Connection) -> Result<(), SqError> {
+fn update_atime(inode: u32, time: DateTime<Utc>, tx: &Connection) -> Result<()> {
     let sql = "UPDATE metadata SET atime=datetime($1), atime_nsec=$2 WHERE id=$3";
     update_time(inode, sql, time, tx)
 }
 
-fn update_mtime(inode: u32, time: DateTime<Utc>, tx: &Connection) -> Result<(), SqError> {
+fn update_mtime(inode: u32, time: DateTime<Utc>, tx: &Connection) -> Result<()> {
     let sql = "UPDATE metadata SET mtime=datetime($1), mtime_nsec=$2 WHERE id=$3";
     update_time(inode, sql, time, tx)
 }
 
-fn update_ctime(inode: u32, time: DateTime<Utc>, tx: &Connection) -> Result<(), SqError> {
+fn update_ctime(inode: u32, time: DateTime<Utc>, tx: &Connection) -> Result<()> {
     let sql = "UPDATE metadata SET ctime=datetime($1), ctime_nsec=$2 WHERE id=$3";
     update_time(inode, sql, time, tx)
 }
 
-fn add_dentry(entry: DEntry, tx: &Connection) -> Result<(), SqError> {
+fn add_dentry(entry: DEntry, tx: &Connection) -> Result<()> {
     let sql = "INSERT INTO dentry VALUES($1, $2, $3, $4)";
     tx.execute(
         sql,
@@ -131,7 +131,7 @@ fn add_dentry(entry: DEntry, tx: &Connection) -> Result<(), SqError> {
     Ok(())
 }
 
-fn inclease_nlink(inode: u32, tx: &Connection) -> Result<u32, SqError> {
+fn inclease_nlink(inode: u32, tx: &Connection) -> Result<u32> {
     let mut nlink: u32 = tx.query_row("SELECT nlink FROM metadata WHERE id=$1", params![inode], |row| row.get(0))?;
     nlink += 1;
     tx.execute("Update metadata SET nlink=$1 where id=$2",
@@ -139,7 +139,7 @@ fn inclease_nlink(inode: u32, tx: &Connection) -> Result<u32, SqError> {
     Ok(nlink)
 }
 
-fn declease_nlink(inode: u32, tx: &Connection) -> Result<u32, SqError> {
+fn declease_nlink(inode: u32, tx: &Connection) -> Result<u32> {
     let mut nlink: u32 = tx.query_row("SELECT nlink FROM metadata WHERE id=$1", params![inode], |row| row.get(0))?;
     if nlink != 0 {
         nlink -= 1;
@@ -149,20 +149,38 @@ fn declease_nlink(inode: u32, tx: &Connection) -> Result<u32, SqError> {
     Ok(nlink)
 }
 
-pub struct Sqlite {
-    conn: Connection
+fn parse_attr(mut stmt: Statement, params: &[&dyn ToSql]) -> Result<DBFileAttr> {
+    let rows = stmt.query_map(params, |row| {
+        Ok(DBFileAttr {
+            ino: row.get(0)?,
+            size: row.get(1)?,
+            blocks: row.get(17).unwrap_or(0),
+            atime: string_to_systemtime(row.get(2)?, row.get(3)?),
+            mtime: string_to_systemtime(row.get(4)?, row.get(5)?),
+            ctime: string_to_systemtime(row.get(6)?, row.get(7)?),
+            crtime: string_to_systemtime(row.get(8)?, row.get(9)?),
+            kind: const_to_file_type(row.get(10)?),
+            perm: row.get(11)?,
+            nlink: row.get(12)?,
+            uid: row.get(13)?,
+            gid: row.get(14)?,
+            rdev: row.get(15)?,
+            flags: row.get(16)?
+        })
+    })?;
+    let mut attrs = Vec::new();
+    for row in rows {
+        attrs.push(row?);
+    }
+    if attrs.len() == 0 {
+        Ok(EMPTY_ATTR)
+    } else {
+        Ok(attrs[0])
+    }
 }
 
-impl Sqlite {
-    pub fn new(path: &Path) -> Result<Self, SqError> {
-        let conn = Connection::open(path)?;
-        // enable foreign key. Sqlite ignores foreign key by default.
-        conn.execute("PRAGMA foreign_keys=ON", NO_PARAMS)?;
-        Ok(Sqlite { conn })
-    }
-
-    fn get_inode_local(&self, inode: u32, tx: &Connection) -> Result<DBFileAttr, SqError> {
-        let sql = "SELECT \
+fn get_inode_local(inode: u32, tx: &Connection) -> Result<DBFileAttr> {
+    let sql = "SELECT \
             metadata.id,\
             metadata.size,\
             metadata.atime,\
@@ -184,50 +202,73 @@ impl Sqlite {
             FROM metadata \
             LEFT JOIN (SELECT count(block_num) block_num FROM data WHERE file_id=$1) AS blocknum
             WHERE id=$1";
-        let stmt = tx.prepare(sql)?;
-        let params = params![inode];
-        self.parse_attr(stmt, params)
-    }
+    let stmt = tx.prepare(sql)?;
+    let params = params![inode];
+    parse_attr(stmt, params)
+}
 
-    fn parse_attr_row(&self, row: &rusqlite::Row) -> Result<DBFileAttr, rusqlite::Error> {
-        Ok(DBFileAttr {
-            ino: row.get(0)?,
-            size: row.get(1)?,
-            blocks: row.get(17).unwrap_or(0),
-            atime: string_to_systemtime(row.get(2)?, row.get(3)?),
-            mtime: string_to_systemtime(row.get(4)?, row.get(5)?),
-            ctime: string_to_systemtime(row.get(6)?, row.get(7)?),
-            crtime: string_to_systemtime(row.get(8)?, row.get(9)?),
-            kind: const_to_file_type(row.get(10)?),
-            perm: row.get(11)?,
-            nlink: row.get(12)?,
-            uid: row.get(13)?,
-            gid: row.get(14)?,
-            rdev: row.get(15)?,
-            flags: row.get(16)?
+fn get_dentry_and_filetype(parent: u32, name: &str, tx: &Connection) -> Result<(u32, u32)> {
+    let sql = "SELECT child_id, file_type FROM dentry WHERE  parent_id=$1 and name=$2";
+    let mut stmt = tx.prepare(sql)?;
+    let res: (u32, u32) = match stmt.query_row(
+        params![parent, name], |row| Ok((row.get(0)?, row.get(1)?))
+    ) {
+        Ok(n) => n,
+        Err(err) => {
+            if err == rusqlite::Error::QueryReturnedNoRows {
+                (0, 0)
+            } else {
+                return Err(Error::from(err))
+            }
+        }
+    };
+    Ok(res)
+}
+
+fn delete_dentry_local(parent: u32, name: &str, tx: &Connection) -> Result<()> {
+    let sql = "DELETE FROM dentry WHERE parent_id=$1 and name=$2";
+    tx.execute(sql, params![parent, name])?;
+    Ok(())
+}
+
+fn check_directory_is_empty_local(inode: u32, tx: &Connection) -> Result<bool> {
+    let sql = "SELECT name FROM dentry where parent_id=$1";
+    let mut stmt = tx.prepare(sql)?;
+    let rows = stmt.query_map(params![inode], |row| {
+        Ok({
+            let name: String;
+            name = row.get(0)?;
+            name
         })
+    })?;
+    for row in rows {
+        let name = row?;
+        if &name != "." && &name != ".." {
+            return Ok(false);
+        }
     }
+    Ok(true)
+}
 
-    fn parse_attr(&self, mut stmt: Statement, params: &[&dyn ToSql]) -> Result<DBFileAttr, SqError> {
-        let rows = stmt.query_map(params, |row| self.parse_attr_row(row))?;
-        let mut attrs = Vec::new();
-        for row in rows {
-            attrs.push(row?);
-        }
-        if attrs.len() == 0 {
-            Ok(EMPTY_ATTR)
-        } else {
-            Ok(attrs[0])
-        }
+pub struct Sqlite {
+    conn: Connection
+}
+
+impl Sqlite {
+    pub fn new(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        // enable foreign key. Sqlite ignores foreign key by default.
+        conn.execute("PRAGMA foreign_keys=ON", NO_PARAMS)?;
+        Ok(Sqlite { conn })
     }
 }
 
 impl DbModule for Sqlite {
-    fn get_inode(&self, inode: u32) -> Result<DBFileAttr, SqError> {
-        self.get_inode_local(inode, &self.conn)
+    fn get_inode(&self, inode: u32) -> Result<DBFileAttr> {
+        get_inode_local(inode, &self.conn)
     }
 
-    fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32, SqError> {
+    fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32> {
         let sql = "INSERT INTO metadata \
             (size,\
             atime,\
@@ -291,7 +332,7 @@ impl DbModule for Sqlite {
         Ok(child)
     }
 
-    fn update_inode(&mut self, attr: DBFileAttr, truncate: bool) -> Result<(), SqError> {
+    fn update_inode(&mut self, attr: DBFileAttr, truncate: bool) -> Result<()> {
         let sql = "UPDATE metadata SET \
             size=$1,\
             atime=datetime($2),\
@@ -340,7 +381,7 @@ impl DbModule for Sqlite {
         Ok(())
     }
 
-    fn delete_inode_if_noref(&mut self, inode: u32) -> Result<(), SqError> {
+    fn delete_inode_if_noref(&mut self, inode: u32) -> Result<()> {
         let sql = "SELECT nlink FROM metadata WHERE id=$1";
         let tx = self.conn.transaction()?;
         let nlink: u32;
@@ -356,7 +397,7 @@ impl DbModule for Sqlite {
         Ok(())
     }
 
-    fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>, SqError> {
+    fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>> {
         let sql = "SELECT child_id, file_type, name FROM dentry WHERE parent_id=$1 ORDER BY name";
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt.query_map(params![inode], |row| {
@@ -373,7 +414,7 @@ impl DbModule for Sqlite {
         Ok(entries)
     }
 
-    fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32, SqError> {
+    fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32> {
         let sql = "SELECT child_id FROM dentry WHERE parent_id=$1 and name=$2";
         let tx = self.conn.transaction()?;
         let child: u32;
@@ -381,31 +422,66 @@ impl DbModule for Sqlite {
             let mut stmt = tx.prepare(sql)?;
             child = stmt.query_row(params![parent, name], |row| row.get(0))?;
         }
-        let sql = "DELETE FROM dentry WHERE parent_id=$1 and name=$2";
-        {
-            tx.execute(sql, params![parent, name])?;
-        }
+        delete_dentry_local(parent, name, &tx)?;
         declease_nlink(child, &tx)?;
         tx.commit()?;
         Ok(child)
     }
 
-    fn check_directory_is_empty(&self, inode: u32) -> Result<bool, SqError> {
-        let sql = "SELECT name FROM dentry where parent_id=$1";
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(params![inode], |row| {
-            Ok({let name: String; name=row.get(0)?; name})
-        })?;
-        for row in rows {
-            let name = row?;
-            if &name != "." && &name != ".." {
-                return Ok(false);
-            }
+    fn move_dentry(&mut self, parent: u32, name: &str, new_parent: u32, new_name: &str) -> Result<u32> {
+        let sql = "UPDATE dentry SET parent_id=$1, name=$2 where parent_id=$3 and name=$4";
+        let tx = self.conn.transaction()?;
+        let (child_id, file_type) = get_dentry_and_filetype(parent, name, &tx)?;
+        if child_id == 0 {
+            return Err(Error::from(ErrorKind::FsNoEnt {description: format!("parent: {} name:{}", parent, name)}));
         }
-        Ok(true)
+        let (exist_id, exist_file_type) = get_dentry_and_filetype(new_parent, new_name, &tx)?;
+        if exist_id != 0 {
+            if file_type != exist_file_type {
+                if exist_file_type == DB_IFDIR {
+                    return Err(Error::from(ErrorKind::FsIsDir {description: format!(
+                        "parent: {} name:{}",
+                        new_parent, new_name
+                    )}));
+                } else if exist_file_type == DB_IFREG {
+                    return Err(Error::from(ErrorKind::FsIsNotDir {description: format!(
+                        "parent: {} name:{}",
+                        new_parent,
+                        new_name
+                    )}));
+                } else {
+                    return Err(Error::from(ErrorKind::Undefined {description: format!(
+                        "parent: {} name:{} has invalid type: {:?}",
+                        new_parent,
+                        new_name,
+                        const_to_file_type(exist_file_type)
+                    )}));
+                }
+            }
+            if exist_file_type == DB_IFDIR {
+                let empty = check_directory_is_empty_local(exist_id, &tx)?;
+                if !empty {
+                    return Err(Error::from(ErrorKind::FsNotEmpty {description: format!(
+                        "parent: {} name:{} is not empty",
+                        new_parent,
+                        new_name
+                    )}));
+                }
+            }
+            delete_dentry_local(new_parent, new_name, &tx)?;
+            declease_nlink(exist_id, &tx)?;
+        }
+        tx.execute(sql, params![new_parent, new_name, parent, name])?;
+
+        tx.commit()?;
+        Ok(exist_id)
     }
 
-    fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr, SqError> {
+    fn check_directory_is_empty(&self, inode: u32) -> Result<bool> {
+        check_directory_is_empty_local(inode,&self.conn)
+    }
+
+    fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr> {
         let sql = "SELECT \
             metadata.id,\
             metadata.size,\
@@ -435,10 +511,10 @@ impl DbModule for Sqlite {
             ";
         let stmt = self.conn.prepare(sql)?;
         let params = params![parent, name];
-        self.parse_attr(stmt, params)
+        parse_attr(stmt, params)
     }
 
-    fn get_data(&mut self, inode:u32, block: u32, length: u32) -> Result<Vec<u8>, SqError> {
+    fn get_data(&mut self, inode:u32, block: u32, length: u32) -> Result<Vec<u8>> {
         let tx = self.conn.transaction()?;
         let row: Vec<u8>;
         {
@@ -451,7 +527,7 @@ impl DbModule for Sqlite {
                     if err == rusqlite::Error::QueryReturnedNoRows {
                         vec![0; length as usize]
                     } else {
-                        return Err(SqError::from(err))
+                        return Err(Error::from(err))
                     }
                 }
             };
@@ -461,7 +537,7 @@ impl DbModule for Sqlite {
         Ok(row)
     }
 
-    fn write_data(&mut self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<(), SqError> {
+    fn write_data(&mut self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
             let db_size: u32 = tx.query_row("SELECT size FROM metadata WHERE id=$1", params![inode], |row| row.get(0))?;
@@ -480,12 +556,12 @@ impl DbModule for Sqlite {
         Ok(())
     }
 
-    fn release_data(&self, inode: u32) -> Result<(), SqError> {
+    fn release_data(&self, inode: u32) -> Result<()> {
         self.conn.execute("DELETE FROM data WHERE file_id=$1", params![inode])?;
         Ok(())
     }
 
-    fn delete_all_noref_inode(&mut self) -> Result<(), SqError> {
+    fn delete_all_noref_inode(&mut self) -> Result<()> {
         self.conn.execute("DELETE FROM metadata WHERE nlink=0", params![])?;
         Ok(())
     }

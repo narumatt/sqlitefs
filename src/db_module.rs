@@ -1,36 +1,38 @@
 pub mod sqlite;
 use std::time::SystemTime;
-use crate::sqerror::SqError;
+use crate::sqerror::{Error, Result};
 use fuse::{FileAttr, FileType};
 use time::Timespec;
 use chrono::{DateTime, Utc, NaiveDateTime};
 
 pub trait DbModule {
     /// Get file metadata. If not found, return an attribute which inode is 0
-    fn get_inode(&self, inode: u32) -> Result<DBFileAttr, SqError>;
+    fn get_inode(&self, inode: u32) -> Result<DBFileAttr>;
     /// Add file or directory.
-    fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32, SqError>;
+    fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32>;
     /// Update file metadata.
-    fn update_inode(&mut self, attr: DBFileAttr, truncate: bool) -> Result<(), SqError>;
+    fn update_inode(&mut self, attr: DBFileAttr, truncate: bool) -> Result<()>;
     // Delete inode if link count is zero.
-    fn delete_inode_if_noref(&mut self, inode: u32) -> Result<(), SqError>;
+    fn delete_inode_if_noref(&mut self, inode: u32) -> Result<()>;
     /// Get directory entries
-    fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>, SqError>;
+    fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>>;
     /// Delete dentry. returns target inode.
-    fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32, SqError>;
+    fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32>;
+    /// Move dentry to another parent or name. Return nonzero inode if new file is overwrote.
+    fn move_dentry(&mut self, parent: u32, name: &str, new_parent: u32, new_name: &str) -> Result<u32>;
     /// check directory is empty.
-    fn check_directory_is_empty(&self, inode: u32) -> Result<bool, SqError>;
+    fn check_directory_is_empty(&self, inode: u32) -> Result<bool>;
     /// lookup a directory entry table and get a file attribute.
     /// If not found, return an attribute which inode is 0
-    fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr, SqError>;
+    fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr>;
     /// Read data from whole block.
-    fn get_data(&mut self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>, SqError>;
+    fn get_data(&mut self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>>;
     /// Write data into whole block.
-    fn write_data(&mut self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<(), SqError>;
+    fn write_data(&mut self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<()>;
     /// Release all data related to inode
-    fn release_data(&self, inode: u32) -> Result<(), SqError>;
+    fn release_data(&self, inode: u32) -> Result<()>;
     /// Delete all inode which nlink is 0.
-    fn delete_all_noref_inode(&mut self) -> Result<(), SqError>;
+    fn delete_all_noref_inode(&mut self) -> Result<()>;
     /// Get block size of filesystem
     fn get_db_block_size(&self) -> u32;
 }

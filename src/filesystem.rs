@@ -10,12 +10,12 @@ use fuse::{
     Request,
     FileType
 };
-use libc::{c_int, ENOENT, ENOTEMPTY};
+use libc::{c_int, ENOENT, ENOTEMPTY, EISDIR, ENOTDIR};
 use std::path::Path;
 use std::ffi::OsStr;
 use crate::db_module::{DbModule, DBFileAttr};
 use crate::db_module::sqlite::Sqlite;
-use crate::sqerror::SqError;
+use crate::sqerror::{Error, ErrorKind};
 use time::Timespec;
 use std::time::SystemTime;
 use std::sync::Mutex;
@@ -32,7 +32,7 @@ pub struct SqliteFs{
 }
 
 impl SqliteFs {
-    pub fn new(path: &str) -> Result<SqliteFs, SqError> {
+    pub fn new(path: &str) -> Result<SqliteFs, Error> {
         let db = match Sqlite::new(Path::new(path)) {
             Ok(n) => n,
             Err(err) => return Err(err)
@@ -222,6 +222,40 @@ impl Filesystem for SqliteFs {
                     return;
                 }
             };
+        }
+        reply.ok();
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        reply: ReplyEmpty
+    ) {
+        let parent = parent as u32;
+        let name = name.to_str().unwrap();
+        let newparent = newparent as u32;
+        let newname = newname.to_str().unwrap();
+        let ino =  match self.db.move_dentry(parent, name, newparent, newname) {
+            Ok(n) => n,
+            Err(err) => match err.kind() {
+                ErrorKind::FsNotEmpty {description} => {reply.error(ENOTEMPTY); debug!("{}", &description); return;},
+                ErrorKind::FsIsDir{description} => {reply.error(EISDIR); debug!("{}", &description); return;},
+                ErrorKind::FsIsNotDir{description} => {reply.error(ENOTDIR); debug!("{}", &description); return;},
+                _ => {reply.error(ENOENT); debug!("{}", err); return;},
+            }
+        };
+        if ino != 0 {
+            let lc_list = self.lookup_count.lock().unwrap();
+            if !lc_list.contains_key(&ino) {
+                match self.db.delete_inode_if_noref(ino) {
+                    Ok(n) => n,
+                    Err(err) => {reply.error(ENOENT); debug!("{}", err); return;},
+                };
+            }
         }
         reply.ok();
     }

@@ -11,7 +11,7 @@ Filesystem in Userspace(FUSE) はLinuxのユーザ空間でファイルシステ
 ただし、カーネルモジュールを作るより楽とはいえ、FUSEを使ったソフトウェアを作成するのは大変です。  
 ある程度ファイルシステムの知識は必要ですし、チュートリアルを見てもほどほどの所で終わってしまい、「あとはsshfsの実装などを見てくれ！」とコードの海に投げ出されます。
 
-本書は、RustによるFUSEインターフェースの実装である `rust-fuse` を用いてFUSEを使ったファイルシステムの実装に挑戦し、
+この記事は、RustによるFUSEインターフェースの実装である `rust-fuse` を用いてFUSEを使ったファイルシステムの実装に挑戦し、
 得られた知見などを記録したものです。
 
 ## FUSEの仕組み(アバウト)
@@ -48,6 +48,7 @@ libfuseはマルチスレッドで動作し、並列I/Oに対応しています�
 今回自分でファイルシステムを実装していく上で、HDDの代わりになるデータの保存先としてsqliteを使用します。
 
 sqliteは可変長のバイナリデータを持てるので、そこにデータを書き込みます。
+トランザクションがあるので、ある程度アトミックな操作ができます。
 DBなので、メタデータの読み書きも割と簡単にできるでしょう。
 
 ## データベース構造
@@ -60,7 +61,7 @@ DBなので、メタデータの読み書きも割と簡単にできるでしょ
 メタデータは一般的なファイルシステムのメタデータと大体同じ形式です。  
 rust-fuseが関数で渡したり要求したりするメタデータ構造体は以下のようになっています。
 
-```
+```rust
 pub struct FileAttr {
     /// Inode number
     pub ino: u64,
@@ -228,7 +229,7 @@ FUSEでは、ルートディレクトリのinode番号は1です。ルートデ�
 
 必要なのは以下の4つの関数です。
 
-```
+```rust
 fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry){
     ...
 }
@@ -254,15 +255,15 @@ open/closeする関数を実装せずにread関数やreaddir関数を実装し�
 ```
 pub trait DbModule {
     /// ファイルのメタデータを取得する。見つからない場合は0を返す
-    fn get_inode(&self, inode: u32) -> Result<DBFileAttr, SqError>;
+    fn get_inode(&self, inode: u32) -> Result<DBFileAttr, Error>;
     /// ディレクトリのinode番号を指定して、ディレクトが持つディレクトリエントリを全て取得する
-    fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>, SqError>;
+    fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>, Error>;
     /// 親ディレクトリのinode番号と名前から、ファイルやサブディレクトリのinode番号とメタデータを得る
     /// inodeが存在しない場合、inode番号が0の空のinodeを返す
-    fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr, SqError>;
+    fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr, Error>;
     /// inode番号とブロック数を指定して、1ブロック分のデータを読み込む
     /// ブロックデータが存在しない場合は、0(NULL)で埋められたブロックを返す
-    fn get_data(&self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>, SqError>;
+    fn get_data(&self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>, Error>;
     /// DBのブロックサイズとして使っている値を得る
     fn get_db_block_size(&self) -> u32;
 }
@@ -271,7 +272,11 @@ pub trait DbModule {
 ## fuseの関数全般の話
 ### fuseの関数
 ファイルシステムなので、関数は基本的に受け身です。システムコールに応じて呼び出されます。  
-`Filesystem` トレイトが定義されているので、必要な関数を適宜実装していきます。
+rust-fuseでは、 `Filesystem` トレイトが定義されているので、必要な関数を適宜実装していきます。
+
+### 引数
+どの関数にも `Request` 型の引数 `req` が存在します。  
+`req.uid()` で実行プロセスのuidが、 `req.gid()` でgidが、 `req.pid()` でpidが取得できます。
 
 ### 戻り値
 各関数に戻り値は存在せず、 `reply` 引数を操作して、呼び出し元に値を受け渡します。  
@@ -280,11 +285,15 @@ pub trait DbModule {
 `reply.ok()` `reply.error(ENOSYS)` `reply.attr(...)` 等 `reply` の型に応じたメソッドが使えます。
 
 ## lookup
-親ディレクトリのinode番号、当該ディレクトリ/ファイルの名前が与えられるので、ディレクトリエントリとメタデータを返します。  
+```
+fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry);
+```
+
+引数の `parent` で親ディレクトリのinode番号、 `name` で当該ディレクトリ/ファイルの名前が与えられるので、ディレクトリエントリとメタデータを返します。  
 lookup実行時には `lookup count` をファイルシステム側で用意して、増やしたりしなければなりませんが、今回はreadonlyのファイルシステムなので無視します。  
 `lookup count` についてはunlink実装時に説明します。
 
-必要なデータは以下の通り。
+必要なデータは以下になります。
 
 ```
     //正常
@@ -300,11 +309,20 @@ lookup実行時には `lookup count` をファイルシステム側で用意し�
 `time::Timespec` で期間を指定します。  
 TTLの間はカーネルは再度問い合わせに来ません。
 
+今回は、以下のような `ONE_SEC` という定数を作って返しています。
+
+```
+const ONE_SEC: Timespec = Timespec{
+    sec: 1,
+    nsec: 0
+};
+```
+
 - ATTR
 
 対象のメタデータ。 `fuse::FileAttr` を返します。
 
-- generation
+- GENERATION
 
 inodeの世代情報を `u64` で返します。削除されたinodeに別のファイルを割り当てた場合、
 前のファイルと違うファイルである事を示すために、generationに別の値を割り当てます。  
@@ -320,7 +338,7 @@ inodeの世代情報を `u64` で返します。削除されたinodeに別のフ
 
 実装は以下のようになります。
 
-```
+```rust
 fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
     match self.db.lookup(parent as u32, name.to_str().unwrap()) {
         Ok(n) => {
@@ -332,10 +350,14 @@ fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntr
 ```
 
 ## getattr
-引数のinode番号で指定されたファイルのメタデータを返します。
+```
+fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr);
+```
+
+引数の `ino` でinode番号が指定されるので、ファイルのメタデータを返します。
 内容については `lookup` で返す `ATTR` と同じです。
 
-```
+```rust
 fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
     match self.db.get_inode(ino as u32) {
         Ok(n) => {
@@ -348,7 +370,11 @@ fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
 ```
 
 ## read
-引数のinode番号で指定されたファイルをoffsetバイト目からsizeバイト分読み込みます。  
+```rust
+fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, reply: ReplyData);
+```
+
+引数の `ino` のinode番号で指定されたファイルを、 `offset` で指定されたバイトから `size` で指定されたバイト分読み込みます。  
 読み込んだデータは `reply.data(&data)` を実行して返します。
 
 ファイルの読み込む位置を指定する方法は色々とありますが、fuseは `pread(2)` 相当の関数を一つ実装するだけで済むようにしてくれています。
@@ -358,7 +384,9 @@ EOFまたはエラーを返す場合を除いて、readはsizeで指定された
 例外として、`direct_io` フラグを `open` の戻り値として指定した場合、カーネルは `read(2)` システムコールの戻り値として、
 ファイルシステムの戻り値を直接使うので、sizeより小さいデータを返してもよいです。
 
-引数の `fh` は `open` 時にファイルシステムが指定した値です。今回は `open` を実装していないので0です。
+引数の `fh` は `open` 時に戻り値としてファイルシステムが指定した値です。同じファイルに対して複数の `open` が来たときに、
+どの `open` に対しての `read` かを識別したり、ファイル毎に状態を持つことができます。  
+今回は `open` を実装していないので常に0が来ます。
 
 ```
 fn read(&mut self, _req: &Request, ino: u64, _fh: u64, _offset: i64, _size: u32, reply: ReplyData) {
@@ -388,6 +416,10 @@ fn read(&mut self, _req: &Request, ino: u64, _fh: u64, _offset: i64, _size: u32,
 ```
 
 ## readdir
+```rust
+fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory);
+```
+
 指定されたinodeのディレクトリのディレクトリエントリを返します。 `ls` コマンドの結果を返すイメージです。  
 一定サイズのバッファが渡されるので、一杯になるまでディレクトリエントリを入れて返します。
 
@@ -410,6 +442,8 @@ result = reply.add(target_inode, offset, FileType.RegularFile, filename);
 カーネルが`readdir`の 引数として `offset` に0でない値を指定してきた場合、
 該当の `offset` を持つディレクトリエントリの、次のディレクトリエントリを返さなければならないからです。  
 `readdir` の引数に `0` が来た場合「最初のディレクトリエントリ」を返さないといけないので、ファイルシステムは `offset` に0を入れてはならないです。
+
+厳密に実装する場合、 `opendir` 時の状態を返さないといけないので、 `opendir` の実装と状態の保持が必要になります。
 
 `.` と `..` は返さなくともよいですが、返さなかった場合の処理は呼び出し側のプログラムに依存します。
 
@@ -527,9 +561,9 @@ fn setattr(&mut self, _req: &Request<'_>, _ino: u64, _mode: Option<u32>, _uid: O
 
 ```
     /// inodeのメタデータを更新する。ファイルサイズが縮小する場合はtruncateをtrueにする
-    fn update_inode(&self, attr: DBFileAttr, truncate: bool) -> Result<(), SqError>;
+    fn update_inode(&self, attr: DBFileAttr, truncate: bool) -> Result<(), Error>;
     /// 1ブロック分のデータを書き込む
-    fn write_data(&self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<(), SqError>;
+    fn write_data(&self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<(), Error>;
 ```
 
 ## write
@@ -642,6 +676,12 @@ DB関数側でこれらを更新できるようにしておきます。
 また、書き込みのオフセットにファイルサイズより大きい値が指定された場合、ファイルに何も書かれていない穴ができます。
 このエリアのデータが読まれた場合、ファイルシステムは0(NULLバイト)の列を返します。
 
+ファイルのブロックをばらばらの順番で書き込む、というのはよくある処理なので、0バイト目から順番に書き込まれていく事は期待しないでください。  
+特に `write` 実行時にファイルサイズを変更する場合は、現在のファイルサイズより小さくならないかチェックしてください。
+
+今回はメタデータもデータもデータベース上にあり、元々パフォーマンスが悪い事が予想されるのであまり意識していませんが、
+メタデータの更新にある程度コストがかかる場合、キャッシュした方がいいです。
+
 マウントオプションで `-o noatime` が指定された場合、 `atime` の更新は行いません。
 
 ### タイムスタンプ
@@ -677,7 +717,8 @@ rust-fuseでは、 `setattr` を実装する事でファイルサイズの変更
 
 なお、 `ctime` は 現在のrust-fuseがプロトコルのバージョンの問題で未対応なので、引数には入っていません。
 
-`truncate(2)` でファイルサイズが変わる場合、元のファイルサイズより小さい値が指定された場合、差分のデータがきちんと破棄されるように、  
+`open` 時に `O_TRUNC` を指定した場合のように、ファイルサイズに0が指定された場合は既存のデータを全て破棄すればいいですが、
+`truncate(2)` で0以外の値にファイルサイズが変わる場合、元のファイルサイズより小さい値が指定された場合、間のデータがきちんと破棄されるように、  
 元のファイルサイズより大きい値が指定された場合、間のデータが0(\0)で埋められるように気をつけてください。
 
 ```
@@ -750,6 +791,7 @@ Update hello world
 次回は、ファイルの作成と削除を実装します。
 
 # ファイルの作成と削除
+## 概要
 ルートディレクトリ上にファイルの作成と削除が行えるようにします。
 
 必要なのは以下の関数です。
@@ -805,15 +847,15 @@ keyがinode番号、valueがlookup count、であるHashMapを作成します。
 
 ```
 /// inodeを追加する
-fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32, SqError>;
+fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32, Error>;
 /// inodeをチェックし、参照カウントが0なら削除する
-fn delete_inode_if_noref(&mut self, inode: u32) -> Result<(), SqError>;
+fn delete_inode_if_noref(&mut self, inode: u32) -> Result<(), Error>;
 /// 親ディレクトリのinode番号、ファイル/ディレクトリ名で指定されたディレクトリエントリを削除し、
 /// 該当のinodeの参照カウントを1減らす
 /// inode番号を返す
-fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32, SqError>;
+fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32, Error>;
 /// 参照カウントが0である全てのinodeを削除する
-fn delete_all_noref_inode(&mut self) -> Result<(), SqError>;
+fn delete_all_noref_inode(&mut self) -> Result<(), Error>;
 ```
 
 ## lookup
@@ -1058,6 +1100,7 @@ ls: cannot access '/home/jiro/mount/test.txt': No such file or directory
 次回は、ディレクトリの作成/削除ができるようにします。
 
 # ディレクトリの作成/削除
+## 概要
 今まではルートディレクトリのみでファイル操作を行っていましたが、
 今回はディレクトリの作成/削除を実装して、サブディレクトリでいろいろできるようにします。
 
@@ -1075,7 +1118,7 @@ fn rmdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: Repl
 
 ```
 /// ディレクトリが空かチェックする
-fn check_directory_is_empty(&self, inode: u32) -> Result<bool, SqError>;
+fn check_directory_is_empty(&self, inode: u32) -> Result<bool, Error>;
 ```
 
 ## mkdir
@@ -1224,3 +1267,100 @@ $ rmdir ~/mount/testdir
 ## まとめ
 これでディレクトリの作成と削除ができるようになりました。
 次回は `rename` で名前の変更と移動ができるようにします。
+
+# 名前の変更と移動
+## 概要
+作成/削除の関数は一通り実装したので、今回はファイル/ディレクトリの移動ができるようにします。
+
+
+## rename
+引数 `parent` で親ディレクトリのinode番号、 `name` でファイルまたはディレクトリ名、
+`newparent` で変更後の親ディレクトリのinode番号,、 `newname` で変更後の名前が指定されるので、
+ファイルまたはディレクトリを移動し、名前を変更します。
+
+cの `fuse_lowlevel` の説明によると、変更先にファイルまたはディレクトリが存在する場合は自動で上書きしなければなりません。  
+つまり、変更先inodeのnlinkを1減らし、ディレクトリエントリから削除します。
+こちらも削除処理と同様に、 `lookup count` が0でない場合は、0になるまでinodeの削除を遅延します。  
+変更先とファイルタイプが異なる場合、チェックはカーネル側がやってくれるようで、 `rename(2)` を実行しても `rename` が呼ばれずにエラーになります。
+
+ただし、変更前がディレクトリで、変更先のディレクトリを上書きする場合、変更先のディレクトリは空でないかファイルシステムがチェックする必要があります。  
+中身がある場合は、エラーとして `ENOTEMPTY` を返します。
+
+cだと 上書き禁止を指定したりできる `flag` が指定されますが、rust-fuseには該当する引数がありません。
+
+```rust
+fn rename(
+    &mut self,
+    _req: &Request<'_>,
+    parent: u64,
+    name: &OsStr,
+    newparent: u64,
+    newname: &OsStr,
+    reply: ReplyEmpty
+) {
+    let parent = parent as u32;
+    let name = name.to_str().unwrap();
+    let newparent = newparent as u32;
+    let newname = newname.to_str().unwrap();
+    // rename. 上書きされる場合は、上書き先のinodeを取得
+    let ino =  match self.db.move_dentry(parent, name, newparent, newname) {
+        Ok(n) => n,
+        Err(err) => match err.kind() {
+            // 空の場合
+            ErrorKind::FsNotEmpty {description} => {reply.error(ENOTEMPTY); debug!("{}", &description); return;},
+            // ファイル -> ディレクトリの場合
+            ErrorKind::FsIsDir{description} => {reply.error(EISDIR); debug!("{}", &description); return;},
+            // ディレクトリ -> ファイルの場合
+            ErrorKind::FsIsNotDir{description} => {reply.error(ENOTDIR); debug!("{}", &description); return;},
+            _ => {reply.error(ENOENT); debug!("{}", err); return;},
+        }
+    };
+    // 上書きがあった場合、各カウントを調べて、削除する必要がある場合は削除する
+    if ino != 0 {
+        let lc_list = self.lookup_count.lock().unwrap();
+        if !lc_list.contains_key(&ino) {
+            match self.db.delete_inode_if_noref(ino) {
+                Ok(n) => n,
+                Err(err) => {reply.error(ENOENT); debug!("{}", err); return;},
+            };
+        }
+    }
+    reply.ok();
+}
+```
+
+## 実行結果
+
+```
+$ mv ~/mount/touch.txt ~/mount/touch3.txt
+$ ls ~/mount/
+hello.txt  testdir  touch3.txt
+```
+
+```text
+[2019-10-31T10:54:17Z DEBUG fuse::request] LOOKUP(442) parent 0x0000000000000001, name "touch.txt"
+[2019-10-31T10:54:17Z DEBUG fuse::request] LOOKUP(444) parent 0x0000000000000001, name "touch3.txt"
+[2019-10-31T10:54:17Z DEBUG fuse::request] LOOKUP(446) parent 0x0000000000000001, name "touch3.txt"
+[2019-10-31T10:54:17Z DEBUG fuse::request] LOOKUP(448) parent 0x0000000000000001, name "touch3.txt"
+[2019-10-31T10:54:17Z DEBUG fuse::request] RENAME(450) parent 0x0000000000000001, name "touch.txt", newparent 0x0000000000000001, newname "touch3.txt"
+[2019-10-31T10:54:17Z DEBUG fuse::request] GETATTR(452) ino 0x0000000000000001
+```
+
+```text
+$ mv ~/mount/touch3.txt ~/mount/testdir
+$ ls ~/mount/testdir
+touch3.txt
+```
+
+```text
+[2019-10-31T10:57:28Z DEBUG fuse::request] LOOKUP(500) parent 0x0000000000000001, name "touch3.txt"
+[2019-10-31T10:57:28Z DEBUG fuse::request] LOOKUP(502) parent 0x0000000000000005, name "touch3.txt"
+[2019-10-31T10:57:28Z DEBUG fuse::request] LOOKUP(504) parent 0x0000000000000005, name "touch3.txt"
+[2019-10-31T10:57:28Z DEBUG fuse::request] LOOKUP(506) parent 0x0000000000000005, name "touch3.txt"
+[2019-10-31T10:57:28Z DEBUG fuse::request] RENAME(508) parent 0x0000000000000001, name "touch3.txt", newparent 0x0000000000000005, newname "touch3.txt"
+[2019-10-31T10:57:28Z DEBUG fuse::request] GETATTR(510) ino 0x0000000000000001
+```
+
+## まとめ
+今回はファイル移動を実装しました。
+
