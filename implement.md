@@ -526,8 +526,8 @@ fn setattr(&mut self, _req: &Request<'_>, _ino: u64, _mode: Option<u32>, _uid: O
 今回追加したDB側の関数は以下になります。
 
 ```
-    /// inodeのメタデータを更新する。
-    fn update_inode(&self, attr: DBFileAttr) -> Result<(), SqError>;
+    /// inodeのメタデータを更新する。ファイルサイズが縮小する場合はtruncateをtrueにする
+    fn update_inode(&self, attr: DBFileAttr, truncate: bool) -> Result<(), SqError>;
     /// 1ブロック分のデータを書き込む
     fn write_data(&self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<(), SqError>;
 ```
@@ -703,6 +703,8 @@ fn setattr(
         Ok(n) => n,
         Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
     };
+    // ファイルサイズの変更チェック
+    let old_size = attr.size;
     // 引数で上書き
     if let Some(n) = mode {attr.perm = n as u16};
     if let Some(n) = uid {attr.uid = n};
@@ -714,7 +716,7 @@ fn setattr(
     if let Some(n) = crtime {attr.crtime = datetime_from_timespec(&n)};
     if let Some(n) = flags {attr.flags = n};
     // 更新
-    match self.db.update_inode(attr) {
+    match self.db.update_inode(attr, old_size > attr.size) {
         Ok(_n) => (),
         Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
     };
@@ -849,7 +851,10 @@ fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntr
 `creat(2)`または `O_CREAT` を指定した `open(2)` 実行時に呼ばれます。
 
 指定されたファイルが存在しない場合、引数の `mode` で指定されたモードでファイルを作成し、ファイルを開きます。  
-作成したユーザ、グループは、引数の `req` から `req.uid()` `req.gid()` で取得できます。
+作成したユーザ、グループは、引数の `req` から `req.uid()` `req.gid()` で取得できます。  
+ただし、マウントオプションで `–o grpid` または `–o bsdgroups` が指定されている場合や、親ディレクトリにsgidが設定されている場合は、
+親ディレクトリと同じグループを設定しないといけません。後々実装します。
+
 ファイルが既に存在する場合、openと同じ動作を行います。  
 `open` と同じ動作のため、open時のフラグが `flags` で渡されます。その他処理は `open` と同じです。
 
@@ -1058,7 +1063,7 @@ ls: cannot access '/home/jiro/mount/test.txt': No such file or directory
 
 ## 実装すべき関数
 ```
-fn mkdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, _mode: u32, reply: ReplyEntry) {
+fn mkdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, reply: ReplyEntry) {
     ...
 }
 fn rmdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEmpty) {
@@ -1069,14 +1074,61 @@ fn rmdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: Repl
 ## 追加したDB関数
 
 ```
-
+/// ディレクトリが空かチェックする
+fn check_directory_is_empty(&self, inode: u32) -> Result<bool, SqError>;
 ```
 
 ## mkdir
-引数で親ディレクトリのinode番号、ディレクトリ名、モードが指定されるので、ディレクトリを作成します。
+引数の `parent` で親ディレクトリのinode番号、 `name` で作成するディレクトリ名、 `mode` でモードが指定されるので、ディレクトリを作成します。
 成功した場合、作成したディレクトリのメタデータを返します。
 
-動作、エラーなどは `mkdir(2)` に従い、
+作成したユーザ、グループは、引数の `req` から `req.uid()` `req.gid()` で取得できます。  
+ただし、マウントオプションで `–o grpid` または `–o bsdgroups` が指定されている場合や、親ディレクトリにsgidが設定されている場合は、
+親ディレクトリと同じグループを設定しないといけません。
+
+また、親ディレクトリにSUIDが設定されていても、SUIDはディレクトリには関係ないので子ディレクトリは無視します。  
+SGID, スティッキービットが設定されている場合、子ディレクトリにも引き継がないといけません。  
+この辺りは処理系定義なので、Linux以外のシステムで、常にディレクトリ作成時にはoffにするものもあるようです。  
+この辺りの処理はファイルの処理と一緒に後で実装します。
+
+既に同名のディレクトリやファイルがあるかどうか、はカーネル側でチェックしてくれているようです。
+
+`mkdir` のコードは以下のようになります。
+
+```
+fn mkdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, reply: ReplyEntry) {
+    let now = SystemTime::now();
+    // 初期メタデータ
+    let mut attr = DBFileAttr {
+        ino: 0,
+        size: 0,
+        blocks: 0,
+        atime: now,
+        mtime: now,
+        ctime: now,
+        crtime: now,
+        kind: FileType::Directory,
+        perm: mode as u16,
+        nlink: 0,
+        uid: req.uid(),
+        gid: req.gid(),
+        rdev: 0,
+        flags: 0
+    };
+    // ディレクトリを作成してinode番号を取得
+    let ino =  match self.db.add_inode(parent as u32, name.to_str().unwrap(), &attr) {
+        Ok(n) => n,
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+    // inode番号を入れてメタデータを返却
+    attr.ino = ino;
+    reply.entry(&ONE_SEC, &attr.get_file_attr(), 0);
+    // lookup countを増やす
+    let mut lc_list = self.lookup_count.lock().unwrap();
+    let lc = lc_list.entry(ino).or_insert(0);
+    *lc += 1;
+}
+```
 
 ## rmdir
 引数で親ディレクトリのinode番号とディレクトリ名が指定されるので、ディレクトリを削除します。
@@ -1087,3 +1139,88 @@ fn rmdir(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: Repl
 
 `unlink` と同様に、 `lookup count` が0でない場合、0になるタイミングまでinodeの削除を遅延します。  
 `forget` 等の内部ではファイルとディレクトリの区別をしていないので、現状の実装でOKです。
+
+```
+fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    let parent = parent as u32;
+    let name = name.to_str().unwrap();
+    let attr = match self.db.lookup(parent, name) {
+        Ok(n) => n,
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+    // ディレクトリが空かどうかチェック
+    let empty = match self.db.check_directory_is_empty(attr.ino){
+        Ok(n) => n,
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+    if !empty {
+        reply.error(ENOTEMPTY);
+        return;
+    }
+    // dentry削除
+    let ino = match self.db.delete_dentry(parent, name) {
+        Ok(n) => n,
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+    // lookup countの処理
+    let lc_list = self.lookup_count.lock().unwrap();
+    if !lc_list.contains_key(&ino) {
+        match self.db.delete_inode_if_noref(ino) {
+            Ok(n) => n,
+            Err(err) => {
+                reply.error(ENOENT);
+                debug!("{}", err);
+                return;
+            }
+        };
+    }
+    reply.ok();
+}
+```
+
+## 実行結果
+ここまでの実行結果は以下のようになります。
+
+```
+$ mkdir ~/mount/testdir/
+$ echo "test" > ~/mount/testdir/test.txt
+$ rmdir ~/mount/testdir
+rmdir: failed to remove '/home/jiro/mount/testdir': Directory not empty
+$ rm ~/mount/testdir/test.txt
+$ rmdir ~/mount/testdir 
+```
+
+```
+// mkdir
+[2019-10-31T06:15:19Z DEBUG fuse::request] GETATTR(146) ino 0x0000000000000001
+[2019-10-31T06:15:32Z DEBUG fuse::request] LOOKUP(148) parent 0x0000000000000001, name "testdir"
+[2019-10-31T06:15:32Z DEBUG fuse::request] MKDIR(150) parent 0x0000000000000001, name "testdir", mode 0o775
+[2019-10-31T06:15:32Z DEBUG fuse::request] GETATTR(152) ino 0x0000000000000001
+// echo "test"
+[2019-10-31T06:15:56Z DEBUG fuse::request] LOOKUP(154) parent 0x0000000000000001, name "testdir"
+[2019-10-31T06:15:56Z DEBUG fuse::request] LOOKUP(156) parent 0x0000000000000004, name "test.txt"
+[2019-10-31T06:15:56Z DEBUG fuse::request] CREATE(158) parent 0x0000000000000004, name "test.txt", mode 0o100664, flags 0x8241
+[2019-10-31T06:15:56Z DEBUG fuse::request] WRITE(160) ino 0x0000000000000005, fh 0, offset 0, size 5, flags 0x0
+[2019-10-31T06:15:56Z DEBUG fuse::request] RELEASE(162) ino 0x0000000000000005, fh 0, flags 0x8001, release flags 0x0, lock owner 0
+[2019-10-31T06:15:56Z DEBUG fuse::request] GETATTR(164) ino 0x0000000000000001
+// rmdir(1回目)
+[2019-10-31T06:16:07Z DEBUG fuse::request] LOOKUP(166) parent 0x0000000000000001, name "testdir"
+[2019-10-31T06:16:07Z DEBUG fuse::request] RMDIR(168) parent 0x0000000000000001, name "testdir"
+[2019-10-31T06:16:07Z DEBUG fuse::request] GETATTR(170) ino 0x0000000000000001
+// rm test.txt
+[2019-10-31T06:16:24Z DEBUG fuse::request] LOOKUP(174) parent 0x0000000000000001, name "testdir"
+[2019-10-31T06:16:24Z DEBUG fuse::request] LOOKUP(176) parent 0x0000000000000004, name "test.txt"
+[2019-10-31T06:16:24Z DEBUG fuse::request] ACCESS(178) ino 0x0000000000000005, mask 0o002
+[2019-10-31T06:16:24Z DEBUG fuse::request] UNLINK(180) parent 0x0000000000000004, name "test.txt"
+[2019-10-31T06:16:24Z DEBUG fuse::request] FORGET(182) ino 0x0000000000000005, nlookup 2
+[2019-10-31T06:16:24Z DEBUG fuse::request] GETATTR(184) ino 0x0000000000000001
+// rmdir(2回目)
+[2019-10-31T06:16:34Z DEBUG fuse::request] LOOKUP(186) parent 0x0000000000000001, name "testdir"
+[2019-10-31T06:16:34Z DEBUG fuse::request] RMDIR(188) parent 0x0000000000000001, name "testdir"
+[2019-10-31T06:16:34Z DEBUG fuse::request] FORGET(190) ino 0x0000000000000004, nlookup 5
+[2019-10-31T06:16:34Z DEBUG fuse::request] GETATTR(192) ino 0x0000000000000001
+```
+
+## まとめ
+これでディレクトリの作成と削除ができるようになりました。
+次回は `rename` で名前の変更と移動ができるようにします。

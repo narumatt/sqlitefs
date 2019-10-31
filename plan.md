@@ -6,11 +6,39 @@
 1. create / delete file
 1. create / delete directory
 1. rename
+1. link, symlink
 1. additional functions and errors
 1. permissions
 1. rock operation
 1. extended attributes
 
+## 未実装リスト
+
+- open
+- flush
+- release
+- fsync
+- readlink
+- mknod
+- symlink
+- rename
+- link
+- opendir
+- releasedir
+- fsyncdir
+- statfs
+- setxattr
+- getxattr
+- listxattr
+- removexattr
+- access
+- getlk
+- setlk
+- bmap
+
+
+- sgid対応
+- シンボリックリンクにrmdirしたときの動作
 
 ## 参考リンク
 
@@ -32,7 +60,7 @@
 
 [libfuseのメーリングリストのアーカイブ](https://sourceforge.net/p/fuse/mailman/fuse-devel/)
 
-[gcfs(rust-fuseの実装例)](https://github.com/harababurel/gcsf)
+[gcsf(rust-fuseの実装例)](https://github.com/harababurel/gcsf)
 
 ## データベース構造
 テーブルはメタデータ(MDT)とディレクトリエントリ(DET)とブロックデータ(BDT)と拡張属性データ(XATTRT)の4つに分ける。

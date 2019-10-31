@@ -137,7 +137,7 @@ impl Filesystem for SqliteFs {
         attr.ctime = SystemTime::now();
         if let Some(n) = crtime {attr.crtime = attr.datetime_from(&n)};
         if let Some(n) = flags {attr.flags = n};
-        match self.db.update_inode(attr, old_size < attr.size) {
+        match self.db.update_inode(attr, old_size > attr.size) {
             Ok(_n) => (),
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
@@ -168,6 +168,10 @@ impl Filesystem for SqliteFs {
         };
         attr.ino = ino;
         reply.entry(&ONE_SEC, &attr.get_file_attr(), 0);
+        let mut lc_list = self.lookup_count.lock().unwrap();
+        let lc = lc_list.entry(ino).or_insert(0);
+        *lc += 1;
+        debug!("filesystem:mkdir, inode: {:?} lookup count:{:?}", ino, *lc);
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
