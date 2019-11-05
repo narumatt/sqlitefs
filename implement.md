@@ -85,11 +85,11 @@ rust-fuseが関数で渡したり要求したりするメタデータ構造体�
 
 ```rust
 pub struct FileAttr {
-    /// Inode number
+    /// inode番号
     pub ino: u64,
-    /// Size in bytes
+    /// ファイルサイズ(バイト単位)
     pub size: u64,
-    /// Size in blocks. *Sparse File に対応する場合、実際に使用しているブロック数を返す
+    /// ブロックサイズ *Sparse File に対応する場合、実際に使用しているブロック数を返す
     pub blocks: u64,
     /// Time of last access. *read(2)実行時に更新される
     pub atime: Timespec,
@@ -99,11 +99,11 @@ pub struct FileAttr {
     pub ctime: Timespec,
     /// Time of creation (macOS only)
     pub crtime: Timespec,
-    /// Kind of file (directory, file, pipe, etc)
+    /// ファイル種別 (directory, file, pipe, etc)
     pub kind: FileType,
-    /// Permissions
+    /// パーミッション
     pub perm: u16,
-    /// Number of hard links
+    /// ハードリンクされている数
     pub nlink: u32,
     /// User id
     pub uid: u32,
@@ -403,12 +403,11 @@ fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, r
 引数の `ino` のinode番号で指定されたファイルを、 `offset` で指定されたバイトから `size` で指定されたバイト分読み込みます。  
 読み込んだデータは `reply.data(&data)` を実行して返します。
 
-ファイルの読み込む位置を指定する方法は色々とありますが、fuseは `pread(2)` 相当の関数を一つ実装するだけで済むようにしてくれています。
-
-EOFまたはエラーを返す場合を除いて、readはsizeで指定されたサイズのデータを返さないといけません。実データが足りなくて返せない場合は0(¥0)埋めします。  
+EOFまたはエラーを返す場合を除いて、readはsizeで指定されたサイズのデータを返さないといけません。
+実データが足りなくて返せない場合は0(¥0)埋めします。  
 例えば、長さ200byteのデータに対して、4096byteの要求が来ることがあるので、3896byte分を0埋めして返さなければなりません。  
-例外として、`direct_io` フラグを `open` の戻り値として指定した場合、カーネルは `read(2)` システムコールの戻り値として、
-ファイルシステムの戻り値を直接使うので、sizeより小さいデータを返してもよいです。
+例外として、`direct_io` フラグを `open` の戻り値として指定した場合、
+カーネルは `read(2)` システムコールの戻り値としてファイルシステムの戻り値を直接使うので、ファイルシステムは実際に読み込んだ長さを返します。
 
 引数の `fh` は `open` 時に戻り値としてファイルシステムが指定した値です。同じファイルに対して複数の `open` が来たときに、
 どの `open` に対しての `read` かを識別したり、ファイル毎に状態を持つことができます。  
@@ -717,25 +716,29 @@ DB関数側でこれらを更新できるようにしておきます。
 マウントオプションで `-o noatime` が指定された場合、 `atime` の更新は行いません。
 
 ### タイムスタンプ
-各関数とどのタイムスタンプを更新すべきかの対応表を示します。  
+各関数とどのタイムスタンプを更新すべきかの対応表です。  
 [Linuxプログラミングインターフェース](https://www.oreilly.co.jp/books/9784873115856/)
-のシステムコールとタイムスタンプの対応表を参考に、FUSEの関数にマップしました。
+のシステムコールとタイムスタンプの対応表を参考に、FUSEの関数にマップしました。  
+左側の `a, m, c` が操作対象のファイルまたはディレクトリのタイムスタンプ、
+右側の `a, m, c` は親ディレクトリのタイムスタンプです。
 
-|関数名|a|m|c|親ディレクトリのa|m|c|備考|
+|関数名|a|m|c|親a|親m|親c|備考|
 |---|---|---|---|---|---|---|---|
-|setattr|||o|||||
-|setattr||o|o||||ファイルサイズが変わる場合|
-|link|||o||o|o||
-|mkdir|o|o|o||o|o||
-|mknod|o|o|o||o|o||
-|create|o|o|o||o|o|新規作成時|
-|read|o|||||||
-|readdir|o|||||||
-|setxattr|||o|||||
-|removexattr|||o|||||
-|rename|||o||o|o|移動前/移動後の両方の親ディレクトリを変更|
-|rmdir|||||o|o||
-|symlink|o|o|o||o|o|リンク自体のタイムスタンプで、リンク先は変更しない|
+|setattr| | |o| | | | |
+|setattr(*)| |o|o| | | | * ファイルサイズが変わる場合 |
+|link| | |o| |o|o| |
+|mkdir|o|o|o| |o|o| |
+|mknod|o|o|o| |o|o| |
+|create|o|o|o| |o|o| |
+|read|o| | | | | | |
+|readdir|o| | | | | | |
+|setxattr| | |o| | | | |
+|removexattr| | |o| | | | |
+|rename| | |o| |o|o|移動前/移動後の両方の親ディレクトリを変更|
+|rmdir| | | | |o|o| |
+|symlink|o|o|o| |o|o|リンク自体のタイムスタンプで、リンク先は変更しない|
+|unlink| | |o| |o|o|参照カウントが2以上でinode自体が消えない場合、ファイルのctimeを更新|
+|write| |o|o| | | | |
 
 ## setattr
 
@@ -793,7 +796,6 @@ fn setattr(
     if let Some(n) = size {attr.size = n as u32};
     if let Some(n) = atime {attr.atime = datetime_from_timespec(&n)};
     if let Some(n) = mtime {attr.mtime = datetime_from_timespec(&n)};
-    attr.ctime = SystemTime::now();
     if let Some(n) = crtime {attr.crtime = datetime_from_timespec(&n)};
     if let Some(n) = flags {attr.flags = n};
     // 更新

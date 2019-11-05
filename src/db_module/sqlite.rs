@@ -48,6 +48,7 @@ fn const_to_file_type(kind: u32) -> FileType {
     }
 }
 
+/// Release all data in "inode", after "offset" byte.
 fn release_data(inode: u32, offset: u32, tx: &Connection) -> Result<()> {
     if offset == 0 {
         tx.execute("DELETE FROM data WHERE file_id=$1", params![inode])?;
@@ -316,6 +317,9 @@ impl DbModule for Sqlite {
             let dentry = DEntry{parent_ino: child, child_ino: child, filename: String::from("."), file_type: attr.kind};
             add_dentry(dentry, &tx)?;
         }
+        let now = Utc::now();
+        update_mtime(parent, now, &tx)?;
+        update_ctime(parent, now, &tx)?;
         tx.commit()?;
         Ok(child)
     }
@@ -337,11 +341,27 @@ impl DbModule for Sqlite {
             rdev=$13,\
             flags=$14 \
              WHERE id=$15";
-        let atime = DateTime::<Utc>::from(attr.atime);
-        let mtime = DateTime::<Utc>::from(attr.mtime);
-        let ctime = DateTime::<Utc>::from(attr.ctime);
-        let crtime = DateTime::<Utc>::from(attr.crtime);
         let tx = self.conn.transaction()?;
+        let oldattr = get_inode_local(attr.ino, &tx)?;
+        let oldattr = match oldattr {
+            Some(n) => n,
+            None => {
+                return Err(Error::from(ErrorKind::FsNoEnt {description: format!(
+                    "{} is not exist",
+                    attr.ino
+                )}));
+            }
+        };
+        let now = Utc::now();
+        let atime = DateTime::<Utc>::from(attr.atime);
+        let mtime;
+        if oldattr.size != attr.size {
+            mtime = now;
+        } else {
+            mtime = DateTime::<Utc>::from(attr.mtime);
+        }
+        let ctime = now;
+        let crtime = DateTime::<Utc>::from(attr.crtime);
         {
             let mut stmt = tx.prepare(sql)?;
             stmt.execute(params![
@@ -403,6 +423,7 @@ impl DbModule for Sqlite {
     }
 
     fn link_dentry(&mut self, inode: u32, parent: u32, name: &str) -> Result<DBFileAttr> {
+        let now = Utc::now();
         let tx = self.conn.transaction()?;
         let attr = match get_inode_local(inode, &tx)? {
             Some(n) => n,
@@ -435,12 +456,16 @@ impl DbModule for Sqlite {
         };
         add_dentry(entry, &tx)?;
         inclease_nlink(inode, &tx)?;
+        update_mtime(inode, now, &tx)?;
+        update_mtime(parent, now, &tx)?;
+        update_ctime(parent, now, &tx)?;
         tx.commit()?;
         Ok(attr)
     }
 
     fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32> {
         let sql = "SELECT child_id FROM dentry WHERE parent_id=$1 and name=$2";
+        let now = Utc::now();
         let tx = self.conn.transaction()?;
         let child: u32;
         {
@@ -449,12 +474,16 @@ impl DbModule for Sqlite {
         }
         delete_dentry_local(parent, name, &tx)?;
         declease_nlink(child, &tx)?;
+        update_ctime(child, now, &tx)?;
+        update_mtime(parent, now, &tx)?;
+        update_ctime(parent, now, &tx)?;
         tx.commit()?;
         Ok(child)
     }
 
     fn move_dentry(&mut self, parent: u32, name: &str, new_parent: u32, new_name: &str) -> Result<Option<u32>> {
         let sql = "UPDATE dentry SET parent_id=$1, name=$2 where parent_id=$3 and name=$4";
+        let now = Utc::now();
         let tx = self.conn.transaction()?;
         let dentry = match get_dentry_single(parent, name, &tx)? {
             Some(n) => n,
@@ -513,7 +542,13 @@ impl DbModule for Sqlite {
             res = Some(v.child_ino);
         }
         tx.execute(sql, params![new_parent, new_name, parent, name])?;
-
+        update_ctime(dentry.child_ino, now, &tx)?;
+        update_mtime(parent, now, &tx)?;
+        update_ctime(parent, now, &tx)?;
+        if parent != new_parent {
+            update_mtime(new_parent, now, &tx)?;
+            update_ctime(new_parent, now, &tx)?;
+        }
         tx.commit()?;
         Ok(res)
     }
@@ -522,7 +557,7 @@ impl DbModule for Sqlite {
         check_directory_is_empty_local(inode,&self.conn)
     }
 
-    fn lookup(&self, parent: u32, name: &str) -> Result<Option<DBFileAttr>> {
+    fn lookup(&mut self, parent: u32, name: &str) -> Result<Option<DBFileAttr>> {
         let sql = "SELECT \
             metadata.id,\
             metadata.size,\
@@ -550,9 +585,13 @@ impl DbModule for Sqlite {
             LEFT JOIN (SELECT file_id file_id, count(block_num) block_num from data) AS blocknum \
             ON dentry.child_id = blocknum.file_id
             ";
-        let stmt = self.conn.prepare(sql)?;
+        let tx = self.conn.transaction()?;
+        let stmt = tx.prepare(sql)?;
         let params = params![parent, name];
-        parse_attr(stmt, params)
+        let result = parse_attr(stmt, params);
+        update_atime(parent, Utc::now(), &tx)?;
+        tx.commit()?;
+        result
     }
 
     fn get_data(&mut self, inode:u32, block: u32, length: u32) -> Result<Vec<u8>> {

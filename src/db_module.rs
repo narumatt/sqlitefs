@@ -6,36 +6,44 @@ use time::Timespec;
 use chrono::{DateTime, Utc, NaiveDateTime};
 
 pub trait DbModule {
-    /// Get file metadata. If not found, return None
+    /// Get metadata. If not found, return None
     fn get_inode(&self, inode: u32) -> Result<Option<DBFileAttr>>;
-    /// Add file or directory.
+    /// Add a file or a directory.
+    /// Update atime, mtime, ctime. Update mtime and ctime of the parent directory.
     fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32>;
     /// Update file metadata.
+    /// Update ctime. Update mtime if filesize is changed.
     fn update_inode(&mut self, attr: DBFileAttr, truncate: bool) -> Result<()>;
-    // Delete inode if link count is zero.
+    // Delete an inode if the link count is zero.
     fn delete_inode_if_noref(&mut self, inode: u32) -> Result<()>;
     /// Get directory entries
     fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>>;
-    /// Add new directory entry which is hard link
+    /// Add a new directory entry which is hard link
+    /// Update mtime, Update mtime and ctime of the parent directory.
     fn link_dentry(&mut self, inode: u32, parent: u32, name: &str) -> Result<DBFileAttr>;
-    /// Delete dentry. returns target inode.
+    /// Delete a dentry. returns target inode.
+    /// Update ctime. Update mtime and ctime of the parent directory.
     fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32>;
-    /// Move dentry to another parent or name. Return some inode number if new file is overwrote.
+    /// Move dentry to another parent or name. Return inode number if a new file is overwrote.
+    /// Update ctime, and mtime and ctime of the parent directories.
     fn move_dentry(&mut self, parent: u32, name: &str, new_parent: u32, new_name: &str) -> Result<Option<u32>>;
-    /// check directory is empty.
+    /// check a directory if it is empty.
     fn check_directory_is_empty(&self, inode: u32) -> Result<bool>;
     /// lookup a directory entry table and get a file attribute.
-    /// If not found, return None
-    fn lookup(&self, parent: u32, name: &str) -> Result<Option<DBFileAttr>>;
-    /// Read data from whole block.
+    /// If not found, return None.
+    /// Update atime.
+    fn lookup(&mut self, parent: u32, name: &str) -> Result<Option<DBFileAttr>>;
+    /// Read data from a whole block.
+    /// Update atime.
     fn get_data(&mut self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>>;
-    /// Write data into whole block.
+    /// Write data into a whole block.
+    /// Update mtime and ctime.
     fn write_data(&mut self, inode:u32, block: u32, data: &[u8], size: u32) -> Result<()>;
-    /// Release all data related to inode
+    /// Release all data related to an inode number.
     fn release_data(&self, inode: u32) -> Result<()>;
-    /// Delete all inode which nlink is 0.
+    /// Delete all inodes which nlink is 0.
     fn delete_all_noref_inode(&mut self) -> Result<()>;
-    /// Get block size of filesystem
+    /// Get block size of the filesystem
     fn get_db_block_size(&self) -> u32;
 }
 

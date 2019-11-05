@@ -146,7 +146,6 @@ impl Filesystem for SqliteFs {
         if let Some(n) = size {attr.size = n as u32};
         if let Some(n) = atime {attr.atime = attr.datetime_from(&n)};
         if let Some(n) = mtime {attr.mtime = attr.datetime_from(&n)};
-        attr.ctime = SystemTime::now();
         if let Some(n) = crtime {attr.crtime = attr.datetime_from(&n)};
         if let Some(n) = flags {attr.flags = n};
         match self.db.update_inode(attr, old_size > attr.size) {
