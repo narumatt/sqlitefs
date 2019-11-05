@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 use chrono::{Utc, DateTime, NaiveDateTime, Timelike};
 use rusqlite::types::ToSql;
 use rusqlite::{params, Connection, NO_PARAMS, Statement};
@@ -14,23 +14,6 @@ const DB_IFBLK: u32 = 0o0060000;
 const DB_IFREG: u32 = 0o0100000;
 const DB_IFLNK: u32 = 0o0120000;
 const DB_IFSOCK: u32 = 0o0140000;
-
-const EMPTY_ATTR: DBFileAttr = DBFileAttr {
-ino: 0,
-size: 0,
-blocks: 0,
-atime: UNIX_EPOCH,
-mtime: UNIX_EPOCH,
-ctime: UNIX_EPOCH,
-crtime: UNIX_EPOCH,
-kind: FileType::RegularFile,
-perm: 0,
-nlink: 0,
-uid: 0,
-gid: 0,
-rdev: 0,
-flags: 0
-};
 
 const BLOCK_SIZE: u32 = 4096;
 
@@ -149,7 +132,7 @@ fn declease_nlink(inode: u32, tx: &Connection) -> Result<u32> {
     Ok(nlink)
 }
 
-fn parse_attr(mut stmt: Statement, params: &[&dyn ToSql]) -> Result<DBFileAttr> {
+fn parse_attr(mut stmt: Statement, params: &[&dyn ToSql]) -> Result<Option<DBFileAttr>> {
     let rows = stmt.query_map(params, |row| {
         Ok(DBFileAttr {
             ino: row.get(0)?,
@@ -173,13 +156,13 @@ fn parse_attr(mut stmt: Statement, params: &[&dyn ToSql]) -> Result<DBFileAttr> 
         attrs.push(row?);
     }
     if attrs.len() == 0 {
-        Ok(EMPTY_ATTR)
+        Ok(None)
     } else {
-        Ok(attrs[0])
+        Ok(Some(attrs[0]))
     }
 }
 
-fn get_inode_local(inode: u32, tx: &Connection) -> Result<DBFileAttr> {
+fn get_inode_local(inode: u32, tx: &Connection) -> Result<Option<DBFileAttr>> {
     let sql = "SELECT \
             metadata.id,\
             metadata.size,\
@@ -207,16 +190,21 @@ fn get_inode_local(inode: u32, tx: &Connection) -> Result<DBFileAttr> {
     parse_attr(stmt, params)
 }
 
-fn get_dentry_and_filetype(parent: u32, name: &str, tx: &Connection) -> Result<(u32, u32)> {
+fn get_dentry_single(parent: u32, name: &str, tx: &Connection) -> Result<Option<DEntry>> {
     let sql = "SELECT child_id, file_type FROM dentry WHERE  parent_id=$1 and name=$2";
     let mut stmt = tx.prepare(sql)?;
-    let res: (u32, u32) = match stmt.query_row(
-        params![parent, name], |row| Ok((row.get(0)?, row.get(1)?))
+    let res: Option<DEntry> = match stmt.query_row(
+        params![parent, name], |row| Ok(Some(DEntry{
+            parent_ino: parent,
+            child_ino: row.get(0)?,
+            file_type: const_to_file_type(row.get(1)?),
+            filename: name.to_string()
+        }))
     ) {
         Ok(n) => n,
         Err(err) => {
             if err == rusqlite::Error::QueryReturnedNoRows {
-                (0, 0)
+                None
             } else {
                 return Err(Error::from(err))
             }
@@ -264,7 +252,7 @@ impl Sqlite {
 }
 
 impl DbModule for Sqlite {
-    fn get_inode(&self, inode: u32) -> Result<DBFileAttr> {
+    fn get_inode(&self, inode: u32) -> Result<Option<DBFileAttr>> {
         get_inode_local(inode, &self.conn)
     }
 
@@ -414,6 +402,43 @@ impl DbModule for Sqlite {
         Ok(entries)
     }
 
+    fn link_dentry(&mut self, inode: u32, parent: u32, name: &str) -> Result<DBFileAttr> {
+        let tx = self.conn.transaction()?;
+        let attr = match get_inode_local(inode, &tx)? {
+            Some(n) => n,
+            None => {
+                return Err(Error::from(ErrorKind::FsNoEnt {description: format!(
+                    "old path {} is not exist",
+                    inode
+                )}));
+            }
+        };
+        if attr.kind != FileType::RegularFile {
+            return Err(Error::from(ErrorKind::FsParm {description: format!(
+                "old path {} is not a regular file",
+                inode
+            )}));
+        };
+        let new_inode = get_dentry_single(parent, name, &tx)?;
+        if new_inode.is_some() {
+            return Err(Error::from(ErrorKind::FsFileExist {description: format!(
+                "new path {}/{} exist",
+                parent,
+                name
+            )}));
+        }
+        let entry = DEntry{
+            parent_ino: parent,
+            child_ino: inode,
+            file_type: FileType::RegularFile,
+            filename: name.to_string()
+        };
+        add_dentry(entry, &tx)?;
+        inclease_nlink(inode, &tx)?;
+        tx.commit()?;
+        Ok(attr)
+    }
+
     fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32> {
         let sql = "SELECT child_id FROM dentry WHERE parent_id=$1 and name=$2";
         let tx = self.conn.transaction()?;
@@ -428,37 +453,52 @@ impl DbModule for Sqlite {
         Ok(child)
     }
 
-    fn move_dentry(&mut self, parent: u32, name: &str, new_parent: u32, new_name: &str) -> Result<u32> {
+    fn move_dentry(&mut self, parent: u32, name: &str, new_parent: u32, new_name: &str) -> Result<Option<u32>> {
         let sql = "UPDATE dentry SET parent_id=$1, name=$2 where parent_id=$3 and name=$4";
         let tx = self.conn.transaction()?;
-        let (child_id, file_type) = get_dentry_and_filetype(parent, name, &tx)?;
-        if child_id == 0 {
-            return Err(Error::from(ErrorKind::FsNoEnt {description: format!("parent: {} name:{}", parent, name)}));
-        }
-        let (exist_id, exist_file_type) = get_dentry_and_filetype(new_parent, new_name, &tx)?;
-        if exist_id != 0 {
-            if file_type != exist_file_type {
-                if exist_file_type == DB_IFDIR {
-                    return Err(Error::from(ErrorKind::FsIsDir {description: format!(
-                        "parent: {} name:{}",
-                        new_parent, new_name
-                    )}));
-                } else if exist_file_type == DB_IFREG {
-                    return Err(Error::from(ErrorKind::FsIsNotDir {description: format!(
-                        "parent: {} name:{}",
-                        new_parent,
-                        new_name
-                    )}));
-                } else {
-                    return Err(Error::from(ErrorKind::Undefined {description: format!(
-                        "parent: {} name:{} has invalid type: {:?}",
-                        new_parent,
-                        new_name,
-                        const_to_file_type(exist_file_type)
-                    )}));
-                }
+        let dentry = match get_dentry_single(parent, name, &tx)? {
+            Some(n) => n,
+            None => {
+                return Err(Error::from(ErrorKind::FsNoEnt {description: format!("parent: {} name:{}", parent, name)}));
             }
-            if exist_file_type == DB_IFDIR {
+        };
+        let mut res = None;
+        let exist_entry = get_dentry_single(new_parent, new_name, &tx)?;
+        if let Some(v) = exist_entry {
+            let exist_id = v.child_ino;
+            let exist_file_type = v.file_type;
+            if dentry.file_type != exist_file_type {
+                match exist_file_type {
+                    FileType::Directory => {
+                        return Err(Error::from(ErrorKind::FsIsDir {
+                            description: format!(
+                                "parent: {} name:{}",
+                                new_parent, new_name
+                            )
+                        }));
+                    },
+                    FileType::RegularFile => {
+                        return Err(Error::from(ErrorKind::FsIsNotDir {
+                            description: format!(
+                                "parent: {} name:{}",
+                                new_parent,
+                                new_name
+                            )
+                        }));
+                    },
+                    _ => {
+                        return Err(Error::from(ErrorKind::Undefined {
+                            description: format!(
+                                "parent: {} name:{} has invalid type: {:?}",
+                                new_parent,
+                                new_name,
+                                exist_file_type
+                            )
+                        }));
+                    }
+                };
+            }
+            if exist_file_type ==FileType::Directory {
                 let empty = check_directory_is_empty_local(exist_id, &tx)?;
                 if !empty {
                     return Err(Error::from(ErrorKind::FsNotEmpty {description: format!(
@@ -470,18 +510,19 @@ impl DbModule for Sqlite {
             }
             delete_dentry_local(new_parent, new_name, &tx)?;
             declease_nlink(exist_id, &tx)?;
+            res = Some(v.child_ino);
         }
         tx.execute(sql, params![new_parent, new_name, parent, name])?;
 
         tx.commit()?;
-        Ok(exist_id)
+        Ok(res)
     }
 
     fn check_directory_is_empty(&self, inode: u32) -> Result<bool> {
         check_directory_is_empty_local(inode,&self.conn)
     }
 
-    fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr> {
+    fn lookup(&self, parent: u32, name: &str) -> Result<Option<DBFileAttr>> {
         let sql = "SELECT \
             metadata.id,\
             metadata.size,\

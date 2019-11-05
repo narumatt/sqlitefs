@@ -1,5 +1,11 @@
 # 概要
 
+## 1行で
+この記事は、RustによるFUSEインターフェースの実装である `rust-fuse` を用いてFUSEを使ったファイルシステムの実装に挑戦し、
+得られた知見などを記録したものです。
+
+## 概要
+
 Filesystem in Userspace(FUSE) はLinuxのユーザ空間でファイルシステムを実現する仕組みです。
 
 一般的にファイルシステムを作るというと、カーネルモジュールを作成しなければならないのでいろいろと苦労が多いですが、FUSEを使えば大分楽に実装できます。  
@@ -8,11 +14,26 @@ Filesystem in Userspace(FUSE) はLinuxのユーザ空間でファイルシステ
 そんな訳で、FUSEを使ったSSH as a filesystem や AWS S3 as a filesystemといった
 「読み書きできる何かをファイルシステムとしてマウント出来るようにするソフトウェア」があれこれと存在します。
 
-ただし、カーネルモジュールを作るより楽とはいえ、FUSEを使ったソフトウェアを作成するのは大変です。  
-ある程度ファイルシステムの知識は必要ですし、チュートリアルを見てもほどほどの所で終わってしまい、「あとはsshfsの実装などを見てくれ！」とコードの海に投げ出されます。
+元々はLinuxの一部でしたが、MacOSやBSD系OSでも使用できます。最近ではWSL2でも使えるようになるようです。導入の手間が要るとはいえ、WindowsでもFUSEが使えるのは嬉しいですね。  
+ちなみにWindowsで動く仮想ファイルシステムである [Dokan](https://github.com/dokan-dev/dokany) もあります。
 
-この記事は、RustによるFUSEインターフェースの実装である `rust-fuse` を用いてFUSEを使ったファイルシステムの実装に挑戦し、
-得られた知見などを記録したものです。
+ただし、カーネルモジュールを作るより楽とはいえ、FUSEを使ったソフトウェアを作成するのは大変です。  
+ある程度ファイルシステムの知識は必要ですし、ドキュメントが少なく、
+チュートリアルを見てもほどほどの所で終わってしまい、「あとはsshfsの実装などを見てくれ！」とコードの海に投げ出されます。
+
+そこで、各所の情報をまとめつつ、自分で0からファイルシステムを実装して気をつける点などを見つけていきます。
+
+## 参考資料
+[rust-fuse](https://github.com/zargony/rust-fuse) : Rust版Fuseプロジェクト  
+[libfuse](https://github.com/libfuse/libfuse) : C版のFuseインターフェースライブラリ  
+[osxfuse](https://github.com/osxfuse/fuse) : MacOS向けのFuseインターフェースライブラリ  
+[FUSEプロトコルの説明](https://john-millikin.com/the-fuse-protocol) : カーネルモジュール <-> Fuseライブラリ間のプロトコル  
+[VFSの説明](https://ja.osdn.net/projects/linuxjf/wiki/vfs.txt)  
+[fuse_lowlevel.h(libfuseのヘッダ)](https://github.com/libfuse/libfuse/blob/master/include/fuse_lowlevel.h): lowlevel関数の説明  
+[fuse_common.h(libfuseのヘッダ)](https://github.com/libfuse/libfuse/blob/master/include/fuse_common.h)  
+[Linuxプログラミングインターフェース(書籍)](https://www.oreilly.co.jp/books/9784873115856/) : システムコールがどう動くべきかは大体ここを見て判断する  
+[libfuseのメーリングリストのアーカイブ](https://sourceforge.net/p/fuse/mailman/fuse-devel/)  
+[gcsf](https://github.com/harababurel/gcsf) : rust-fuseを使ったファイルシステム  
 
 ## FUSEの仕組み(アバウト)
 
@@ -21,7 +42,7 @@ FUSE本体はLinuxカーネルに付属するカーネルモジュールで、�
 FUSEを使ったファイルシステムがマウントされたディレクトリ内に対してシステムコールが呼ばれると、以下のように情報がやりとりされます。
 
 ```
-システムコール <-> VFS <-> FUSE <-> FUSEインターフェース <-> 自分のプログラム
+システムコール <-> VFS <-> FUSE <-(FUSE ABI)-> FUSEインターフェース <-(FUSE API)-> 自分のプログラム
 ```
 
 [Wikipediaの図](https://ja.wikipedia.org/wiki/Filesystem_in_Userspace) を見ると分かりやすいです。
@@ -31,16 +52,17 @@ FUSEを使ったファイルシステムがマウントされたディレクト�
 FUSEはデバイス `/dev/fuse` を持ち、ここを通じてユーザ空間とやりとりを行います。  
 前項の `FUSE <-> FUSEインターフェース` の部分です。
 
-規定のプロトコルを用いて `/dev/fuse` に対してデータを渡したり受け取ったりするのがFUSEインターフェースです。  
+規定のプロトコル(FUSE ABI)を用いて `/dev/fuse` に対してデータを渡したり受け取ったりするのがFUSEインターフェースです。  
 有名な実装として、 [libfuse](https://github.com/libfuse/libfuse) があります。  
 このlibfuseが大変強力なので、大抵の言語でのFUSEインターフェースはlibfuseのラッパーになっています。
 
 ## rust-fuse
 Rustには(ほぼ)独自のFUSEインターフェースの実装 `Rust FUSE(rust-fuse)` があります。ありがたいですね。  
-プロトコルが同じなので、インターフェースの関数はlibfuseのlowlevel関数と大変似ています。そのため、何か困った時にはlibfuseの情報が流用できたりします。ありがたいですね。
+プロトコルが同じなので、インターフェースの関数(FUSE API)はlibfuseのlowlevel関数と大変似ています。そのため、何か困った時にはlibfuseの情報が流用できたりします。ありがたいですね。
 
 現時点(2019/10) の最新版は0.3.1で、2年ぐらい更新されていませんが、次バージョン(0.4.0)が開発中です。  
-0.3.1と0.4.0では日時関係の型が大幅に違うので注意してください。
+0.3.1と0.4.0では日時関係の型が大幅に違うので注意してください。  
+また、0.3.1では対応するプロトコルのバージョンが7.8で、最新のものと比較していくつかの機能がありません。
 
 libfuseはマルチスレッドで動作し、並列I/Oに対応していますが、rust-fuseはシングルスレッドのようです。
 
@@ -157,8 +179,8 @@ BDTはファイルのinode番号, 何番目のブロックか、の列を持ち�
 |file_type|int|ファイルタイプ|
 |name|text|ファイル/ディレクトリ名 (pkey)|
 
-あらゆるディレクトリは `.` と `..` のエントリを持ちます。(ルートの `..` は `.` です。)  
-`.` と `..` は返さなくともよい事になっていますが、その場合は呼び出し側の責任で処理する事になります。
+あらゆるディレクトリは `.` (自分自身)と `..` (親ディレクトリ)のエントリを持ちます。(ルートの `..` は `.` です。)  
+`.` と `..` は返さなくともよい事になっていますが、その場合は呼び出し側のプログラムの責任で処理する事になります。
 
 ファイルタイプはメタデータとディレクトリエントリで2重に持っていますが、ファイルタイプを変更する機能は無いのでよしとします。
 
@@ -227,7 +249,7 @@ FUSEでは、ルートディレクトリのinode番号は1です。ルートデ�
 1. ファイルシステムはリードオンリー
 1. ルート直下に `hello.txt` というファイルがあり、 `"Hello World!\n"` という文字列が書き込まれている
 
-必要なのは以下の4つの関数です。
+`HelloFS` の機能を実現するのに必要なのは以下の4つの関数です。
 
 ```rust
 fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry){
@@ -244,7 +266,7 @@ fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply
 }
 ```
 
-open/closeする関数を実装せずにread関数やreaddir関数を実装していますが、今回のようにreadonlyで状態を持たないファイルシステムの場合、デフォルトの実装で動作します。  
+ファイルやディレクトリをopen/closeする関数を実装せずにread関数やreaddir関数を実装していますが、今回のようにreadonlyで状態を持たないファイルシステムの場合、デフォルトの実装で動作します。  
 これらの関数については今後実装する必要が出てきた時に説明します。
 
 
@@ -279,26 +301,30 @@ rust-fuseでは、 `Filesystem` トレイトが定義されているので、必
 `req.uid()` で実行プロセスのuidが、 `req.gid()` でgidが、 `req.pid()` でpidが取得できます。
 
 ### 戻り値
-各関数に戻り値は存在せず、 `reply` 引数を操作して、呼び出し元に値を受け渡します。  
+`init` 以外の各関数に戻り値は存在せず、 `reply` 引数を操作して、呼び出し元に値を受け渡します。  
 `ReplyEmpty, ReplyData, ReplyAttr` のように、関数に応じて `reply` の型が決まっています。
 
-`reply.ok()` `reply.error(ENOSYS)` `reply.attr(...)` 等 `reply` の型に応じたメソッドが使えます。
+`reply.ok()` `reply.error(ENOSYS)` `reply.attr(...)` 等 `reply` の型に応じたメソッドを実行します。
+
+エラーの場合、 `libc::ENOSYS` `libc::ENOENT` のような定数を `reply.error()` の引数に指定します。
 
 ## lookup
-```
+```rust
 fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry);
 ```
 
-引数の `parent` で親ディレクトリのinode番号、 `name` で当該ディレクトリ/ファイルの名前が与えられるので、ディレクトリエントリとメタデータを返します。  
-lookup実行時には `lookup count` をファイルシステム側で用意して、増やしたりしなければなりませんが、今回はreadonlyのファイルシステムなので無視します。  
+引数の `parent` で親ディレクトリのinode番号、 `name` で当該ディレクトリ/ファイルの名前が与えられるので、
+ディレクトリエントリとメタデータを返します。  
+lookup実行時には `lookup count` をファイルシステム側で用意して、増やしたりしなければなりませんが、
+今回はreadonlyのファイルシステムなので無視します。  
 `lookup count` についてはunlink実装時に説明します。
 
-必要なデータは以下になります。
+replyに必要なデータは以下になります。
 
 ```
     //正常
     reply.entry(&TTL, &ATTR, &GENERATION);
-    エラー
+    エラーの場合
     reply.error(ENOENT);
 ```
 
@@ -350,7 +376,7 @@ fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntr
 ```
 
 ## getattr
-```
+```rust
 fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr);
 ```
 
@@ -388,7 +414,7 @@ EOFまたはエラーを返す場合を除いて、readはsizeで指定された
 どの `open` に対しての `read` かを識別したり、ファイル毎に状態を持つことができます。  
 今回は `open` を実装していないので常に0が来ます。
 
-```
+```rust
 fn read(&mut self, _req: &Request, ino: u64, _fh: u64, _offset: i64, _size: u32, reply: ReplyData) {
     let mut data: Vec<u8> = Vec::with_capacity(_size as usize);
     let block_size: u32 = self.db.get_db_block_size();
@@ -567,12 +593,18 @@ fn setattr(&mut self, _req: &Request<'_>, _ino: u64, _mode: Option<u32>, _uid: O
 ```
 
 ## write
+
+```rust
+fn write(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, data: &[u8], flags: u32, reply: ReplyWrite);
+```
+
 引数の `inode` で指定されたファイルに `data` で渡ってきたデータを書き込みます。
 
 `write(2)` のようなシステムコールを使う場合はファイルオフセットを意識する必要がありますが、
 fuseはカーネルがオフセットの管理をしてくれているので、 `pwrite(2)` 相当の関数を一つ実装するだけで済むようになっています。
 
-マウントオプションに `direct_io` が設定されていない場合、エラーを返す場合を除いて、writeはsizeで指定された数字をreplyで返さないといけません。
+マウントオプションに `direct_io` が設定されていない場合、エラーを返す場合を除いて、writeはsizeで指定された数字をreplyで返さないといけません。  
+指定されている場合は、実際に書き込んだバイト数を返します。
 
 引数の `fh` は `open` 時にファイルシステムが指定した値です。今回はまだopenを実装していないので、常に0になります。
 
@@ -587,7 +619,7 @@ fuseはカーネルがオフセットの管理をしてくれているので、 
 
 ライトバックキャッシュが有効の時、 `offset` はカーネルが適切に設定してくれます。 `O_APPEND` は無視してください。
 
-実際には `O_APPEND` に対して適切に処理していないファイルシステムが多く、(今のところ)カーネルはどのような場合でも `offset` をきちんと設定してくれます。  
+実際には `O_APPEND` に対して適切に処理していないファイルシステムが多く、(今のところ)カーネルは `offset` をきちんと設定してくれるようです。  
 なので、現状は `O_APPEND` は無視し、 `open` 実装時に対応します。
 
 ### ここまでのコード
@@ -697,7 +729,6 @@ DB関数側でこれらを更新できるようにしておきます。
 |mkdir|o|o|o||o|o||
 |mknod|o|o|o||o|o||
 |create|o|o|o||o|o|新規作成時|
-|open, create|o|o|o||||O_TRUNCの場合|
 |read|o|||||||
 |readdir|o|||||||
 |setxattr|||o|||||
@@ -707,10 +738,17 @@ DB関数側でこれらを更新できるようにしておきます。
 |symlink|o|o|o||o|o|リンク自体のタイムスタンプで、リンク先は変更しない|
 
 ## setattr
+
+```rust
+fn setattr(&mut self, _req: &Request<'_>, ino: u64, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, atime: Option<Timespec>, mtime: Option<Timespec>, fh: Option<u64>, crtime: Option<Timespec>, chgtime: Option<Timespec>, bkuptime: Option<Timespec>, flags: Option<u32>, reply: ReplyAttr);
+```
+
 `write` は実装しましたが、このままでは追記しかできません。  
 ファイルを丸ごと更新するために、ファイルサイズを0にする(truncateに相当) 処理を実装します。
 
 rust-fuseでは、 `setattr` を実装する事でファイルサイズの変更が可能になります。
+
+`truncate(2)` でファイルサイズを変更する時、 `open(2)` で `O_TRUNC` を指定した時も、この関数が呼ばれます。
 
 `setattr` は引数に `Option` で値が指定されるので、中身がある場合はその値で更新していきます。  
 `reply` に入れる値は、更新後のメタデータです。
@@ -718,8 +756,10 @@ rust-fuseでは、 `setattr` を実装する事でファイルサイズの変更
 なお、 `ctime` は 現在のrust-fuseがプロトコルのバージョンの問題で未対応なので、引数には入っていません。
 
 `open` 時に `O_TRUNC` を指定した場合のように、ファイルサイズに0が指定された場合は既存のデータを全て破棄すればいいですが、
-`truncate(2)` で0以外の値にファイルサイズが変わる場合、元のファイルサイズより小さい値が指定された場合、間のデータがきちんと破棄されるように、  
+`truncate(2)` で0以外の元のファイルサイズより小さい値が指定された場合、間のデータがきちんと破棄されるように、  
 元のファイルサイズより大きい値が指定された場合、間のデータが0(\0)で埋められるように気をつけてください。
+
+macOS用に `chgtime` と `bkuptime` が引数にありますが、今回はスルーします。
 
 ```
 fn setattr(
@@ -831,7 +871,7 @@ lookup countは最初は0で、ReplyEntryとReplyCreateがある全ての関数�
 
 lookup countを実装するために、ファイルシステムの構造体に次の変数を追加します。
 
-```
+```rust
 pub struct SqliteFs{
     /// DBとやり取りする
     db: Sqlite,
@@ -888,12 +928,17 @@ fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntr
 ```
 
 ## create
-ファイルを作成します。
+
+```rust
+fn create(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, flags: u32, reply: ReplyCreate);
+```
+
+引数の `parent` のinode番号で指定されたディレクトリ内の、 `name` で指定されたファイル名を持つファイルを作成します。
 
 `creat(2)`または `O_CREAT` を指定した `open(2)` 実行時に呼ばれます。
 
 指定されたファイルが存在しない場合、引数の `mode` で指定されたモードでファイルを作成し、ファイルを開きます。  
-作成したユーザ、グループは、引数の `req` から `req.uid()` `req.gid()` で取得できます。  
+ファイルのオーナーに設定するユーザ、グループは、引数の `req` から `req.uid()` `req.gid()` で取得できます。  
 ただし、マウントオプションで `–o grpid` または `–o bsdgroups` が指定されている場合や、親ディレクトリにsgidが設定されている場合は、
 親ディレクトリと同じグループを設定しないといけません。後々実装します。
 
@@ -965,7 +1010,12 @@ fn create(
 ```
 
 ## unlink
-親ディレクトリのinode番号 `parent`, ファイル/ディレクトリ名 `name` が引数で指定されるので、
+
+```rust
+fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty);
+```
+
+親ディレクトリのinode番号が引数の `parent`, ファイル/ディレクトリ名が `name` で指定されるので、
 ファイルまたはディレクトリを削除します。
 
 削除対象はディレクトリエントリと、該当のinodeのメタデータです。
@@ -993,9 +1043,15 @@ fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: Reply
 ```
 
 ## forget
-lookup countを忘れます。
+
+```rust
+fn forget(&mut self, _req: &Request<'_>, _ino: u64, _nlookup: u64);
+```
+
+lookup countを減らします。
 
 引数の `ino` で対象のinode番号、 `nlookup` で減らす数が指定されます。  
+inodeの削除が遅延されている場合、lookup countが0になったタイミングで削除します。
 
 ```
 fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
@@ -1017,6 +1073,11 @@ fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
 ```
 
 ## destroy
+
+```rust
+fn destroy(&mut self, _req: &Request<'_>);
+```
+
 ファイルシステムの終了時に呼ばれる関数です。
 
 ファイルシステムのアンマウント時には、全ての lookup count が0になる事が期待されます。  
@@ -1037,6 +1098,11 @@ fn destroy(&mut self, _req: &Request<'_>) {
 ```
 
 ## init
+
+```rust
+fn init(&mut self, _req: &Request<'_>) -> Result<(), c_int>;
+```
+
 ファイルシステムのマウント時に最初に呼ばれる関数です。
 
 何らかの事情で `destroy` が呼ばれずにファイルシステムが終了した場合、参照カウントが0のままのinodeが残り続ける事になるので、
@@ -1105,7 +1171,7 @@ ls: cannot access '/home/jiro/mount/test.txt': No such file or directory
 今回はディレクトリの作成/削除を実装して、サブディレクトリでいろいろできるようにします。
 
 ## 実装すべき関数
-```
+```rust
 fn mkdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, reply: ReplyEntry) {
     ...
 }
@@ -1122,6 +1188,10 @@ fn check_directory_is_empty(&self, inode: u32) -> Result<bool, Error>;
 ```
 
 ## mkdir
+```rust
+fn mkdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, reply: ReplyEntry);
+```
+
 引数の `parent` で親ディレクトリのinode番号、 `name` で作成するディレクトリ名、 `mode` でモードが指定されるので、ディレクトリを作成します。
 成功した場合、作成したディレクトリのメタデータを返します。
 
@@ -1174,9 +1244,13 @@ fn mkdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, rep
 ```
 
 ## rmdir
-引数で親ディレクトリのinode番号とディレクトリ名が指定されるので、ディレクトリを削除します。
+```rust
+fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty);
+```
 
-当然ながらディレクトリ内になにかある場合は削除できません。  
+引数の `parent` で親ディレクトリのinode番号が、 `name` でディレクトリ名が指定されるので、ディレクトリを削除します。
+
+ディレクトリ内になにかある場合は削除できません。  
 ファイルシステム側でチェックを行い、ディレクトリが空ではない( `.` と `..` 以外のエントリがある) 場合はエラーを返します。  
 `rmdir(2)` のmanによると、 `ENOTEMPTY` または `EEXIST` を返します。Linuxファイルシステムでは `ENOTEMPTY` がメジャーのようです。
 
@@ -1272,8 +1346,19 @@ $ rmdir ~/mount/testdir
 ## 概要
 作成/削除の関数は一通り実装したので、今回はファイル/ディレクトリの移動ができるようにします。
 
+## DB関数
+作成したDB関数は以下になります。
+
+```rust
+/// dentryを移動させる。移動先を上書きする場合、元から有ったファイル/ディレクトリのinode番号を返す
+fn move_dentry(&mut self, parent: u32, name: &str, new_parent: u32, new_name: &str) -> Result<u32>;
+```
 
 ## rename
+```rust
+fn rename(&mut self, _req: &Request, parent: u64, name: &OsStr, newparent: u64, newname: &OsStr, reply: ReplyEmpty);
+```
+
 引数 `parent` で親ディレクトリのinode番号、 `name` でファイルまたはディレクトリ名、
 `newparent` で変更後の親ディレクトリのinode番号,、 `newname` で変更後の名前が指定されるので、
 ファイルまたはディレクトリを移動し、名前を変更します。
@@ -1286,7 +1371,10 @@ cの `fuse_lowlevel` の説明によると、変更先にファイルまたは�
 ただし、変更前がディレクトリで、変更先のディレクトリを上書きする場合、変更先のディレクトリは空でないかファイルシステムがチェックする必要があります。  
 中身がある場合は、エラーとして `ENOTEMPTY` を返します。
 
-cだと 上書き禁止を指定したりできる `flag` が指定されますが、rust-fuseには該当する引数がありません。
+`rename(2)` には、移動前と移動後のファイルが同じ場合何もしない、ディレクトリを自分自身のサブディレクトリに移動できない、などの制約がありますが、
+この辺りはカーネルが処理してくれているようで、 `rename` 関数が呼ばれません。
+
+cだと 上書き禁止を指定したりできる `flag` が引数に指定されますが、rust-fuseには該当する引数がありません。
 
 ```rust
 fn rename(
@@ -1308,9 +1396,9 @@ fn rename(
         Err(err) => match err.kind() {
             // 空の場合
             ErrorKind::FsNotEmpty {description} => {reply.error(ENOTEMPTY); debug!("{}", &description); return;},
-            // ファイル -> ディレクトリの場合
+            // ファイル -> ディレクトリの場合(カーネルがチェックしているので発生しないはず)
             ErrorKind::FsIsDir{description} => {reply.error(EISDIR); debug!("{}", &description); return;},
-            // ディレクトリ -> ファイルの場合
+            // ディレクトリ -> ファイルの場合(カーネルがチェックしているので発生しないはず)
             ErrorKind::FsIsNotDir{description} => {reply.error(ENOTDIR); debug!("{}", &description); return;},
             _ => {reply.error(ENOENT); debug!("{}", err); return;},
         }
@@ -1362,5 +1450,213 @@ touch3.txt
 ```
 
 ## まとめ
-今回はファイル移動を実装しました。
+今回はファイル移動を実装しました。  
+次回はシンボリックリンク、ハードリンクを実装していきます。
 
+# シンボリックリンク・ハードリンク
+シンボリックリンクとハードリンクを作成できるようにします。
+実装する関数は以下になります。
+
+```rust
+fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+    ...
+}
+fn symlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, link: &Path, reply: ReplyEntry) {
+    ...
+}
+fn link(&mut self, _req: &Request<'_>, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
+    ...
+}
+```
+
+## DB関数
+追加したDB関数は以下になります。
+
+```rust
+/// ハードリンクを追加する。ディレクトリエントリを追加し、参照カウントを1増やす
+fn link_dentry(&mut self, inode: u32, parent: u32, name: &str) -> Result<DBFileAttr>;
+```
+
+
+## link
+```rust
+fn link(&mut self, _req: &Request<'_>, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry);
+```
+
+引数 `ino` で対象のinode番号、 `newparent` で親ディレクトリのinode、 `newname` で名前が与えられるので、ハードリンクを作成します。
+
+ハードリンクを作成することで、別のパスが全く同じファイルを指す事ができます。
+inode番号が同じなので、ファイルパス以外のデータ、メタデータは同じになります。  
+全てのハードリンクが削除されるまで、ファイルは削除されません。
+
+ハードリンクはディレクトリに適用する事はできません。また、ディレクトリのハードリンクを作成することはできません。  
+これらのチェックはカーネルがやっていて、 `link(2)` を実行した場合エラーになり、 `link` 関数が呼ばれません。
+
+`link` も `lookup count` を1増やす事に注意してください。
+
+```rust
+fn link(&mut self, _req: &Request<'_>, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
+    // リンクの追加
+    let attr = match self.db.link_dentry(ino as u32, newparent as u32, newname.to_str().unwrap()) {
+        Ok(n) => n,
+        Err(err) => match err.kind() {
+            // 元のパスがディレクトリだった(カーネルがチェックしているので発生しないはず)
+            ErrorKind::FsParm{description} => {reply.error(EPERM); debug!("{}", &description); return;},
+            // リンク先にファイルまたはディレクトリがある(カーネルがチェックしているので発生しないはず)
+            ErrorKind::FsFileExist{description} => {reply.error(EEXIST); debug!("{}", &description); return;},
+            _ => {reply.error(ENOENT); debug!("{}", err); return;}
+        }
+    };
+    reply.entry(&ONE_SEC, &attr.get_file_attr(), 0);
+    // lookup countの追加
+    let mut lc_list = self.lookup_count.lock().unwrap();
+    let lc = lc_list.entry(ino as u32).or_insert(0);
+    *lc += 1;
+}
+```
+
+## symlink
+```rust
+fn symlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, link: &Path, reply: ReplyEntry);
+```
+
+引数の `link` で指定されたパスに対するシンボリックリンクを、
+`parent` で指定されたinode番号のディレクトリ内に、 `name` という名前で作成します。
+
+シンボリックリンクはリンク先のパスをデータに持つ特殊なファイルです。  
+ファイルシステムはパスを保存するだけで、リンク先に対して特に操作を行う必要はありません。
+リンク先にファイルやディレクトリが存在していなくてもOKです。
+
+シンボリックリンクの内容が長すぎる場合、 `ENAMETOOLONG` を返すことができます。  
+どの程度の長さでエラーにするかはファイルシステムが決めますが、あまり長くても(4096を超えるぐらい)カーネルが別のエラーを返してくるので、
+1024～4096ぐらいの間に設定しておくといいです。
+
+`symlink` もlookup count を増やす必要がある事に注意してください。
+
+```rust
+fn symlink(&mut self, req: &Request, parent: u64, name: &OsStr, link: &Path, reply: ReplyEntry) {
+    let now = SystemTime::now();
+    // メタデータの追加
+    let mut attr = DBFileAttr {
+        ino: 0,
+        size: 0,
+        blocks: 0,
+        atime: now,
+        mtime: now,
+        ctime: now,
+        crtime: now,
+        kind: FileType::Symlink,
+        perm: 0o777, // リンク自体のパーミッションは使われないので適当に設定する
+        nlink: 0,
+        uid: req.uid(),
+        gid: req.gid(),
+        rdev: 0,
+        flags: 0
+    };
+    let ino = match self.db.add_inode(parent as u32, name.to_str().unwrap(), &attr) {
+        Ok(n) => n,
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+    let data = link.to_str().unwrap().as_bytes();
+    let block_size = self.db.get_db_block_size() as usize;
+    if data.len() > block_size {
+        reply.error(ENAMETOOLONG);
+        return;
+    }
+    // ファイルの内容(リンク先のパス)の書き込み
+    match self.db.write_data(ino, 1, &data, data.len() as u32) {
+        Ok(n) => n,
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    }
+    attr.ino = ino;
+    reply.entry(&ONE_SEC, &attr.get_file_attr(), 0);
+}
+```
+
+## readlink
+
+```rust
+fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData);
+```
+
+引数の `ino` で指定されたシンボリックリンクの内容(シンボリックリンク先のパス) を返します。
+
+```rust
+fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+    let ino = ino as u32;
+    let attr = match self.db.get_inode(ino) {
+        Ok(n) => match n {
+            Some(attr) => attr,
+            None => {reply.error(ENOENT); return;}
+        },
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+
+    if attr.kind != FileType::Symlink {
+        reply.error(EINVAL);
+        return;
+    }
+    let size = attr.size;
+    let mut data = match self.db.get_data(ino as u32, 1, size) {
+        Ok(n) => n,
+        Err(_err) => {reply.error(ENOENT); return; }
+    };
+    data.resize(size as usize, 0);
+    reply.data(&data);
+}
+```
+
+## 実行結果
+
+### ハードリンクの作成
+
+```text
+$ ln hello.txt hello.hardlink
+$ cat hello.hardlink
+Hello world!
+```
+
+```text
+[2019-11-05T11:12:56Z DEBUG fuse::request] LOOKUP(104) parent 0x0000000000000001, name "hello.txt"
+[2019-11-05T11:12:56Z DEBUG fuse::request] LOOKUP(106) parent 0x0000000000000001, name "hello.hardlink"
+[2019-11-05T11:12:56Z DEBUG fuse::request] LINK(108) ino 0x0000000000000002, newparent 0x0000000000000001, newname "hello.hardlink"
+[2019-11-05T11:12:56Z DEBUG fuse::request] GETATTR(110) ino 0x0000000000000001
+[2019-11-05T11:13:01Z DEBUG fuse::request] OPEN(120) ino 0x0000000000000002, flags 0x8000
+[2019-11-05T11:13:01Z DEBUG fuse::request] READ(122) ino 0x0000000000000002, fh 0, offset 0, size 4096
+[2019-11-05T11:13:01Z DEBUG fuse::request] RELEASE(124) ino 0x0000000000000002, fh 0, flags 0x8000, release flags 0x0, lock owner 0
+[2019-11-05T11:13:01Z DEBUG fuse::request] GETATTR(126) ino 0x0000000000000001
+```
+
+### シンボリックリンクの作成
+
+```text
+$ ln -s hello.txt hello.symlink
+$ cat hello.symlink
+Hello world!
+```
+
+```text
+[2019-11-05T11:15:55Z DEBUG fuse::request] LOOKUP(134) parent 0x0000000000000001, name "hello.symlink"
+[2019-11-05T11:15:55Z DEBUG fuse::request] SYMLINK(136) parent 0x0000000000000001, name "hello.symlink", link "hello.txt"
+[2019-11-05T11:15:55Z DEBUG fuse::request] GETATTR(138) ino 0x0000000000000001
+[2019-11-05T11:16:01Z DEBUG fuse::request] LOOKUP(146) parent 0x0000000000000001, name "hello.symlink"
+[2019-11-05T11:16:01Z DEBUG fuse::request] READLINK(148) ino 0x000000000000000a
+[2019-11-05T11:16:01Z DEBUG fuse::request] LOOKUP(150) parent 0x0000000000000001, name "hello.txt"
+[2019-11-05T11:16:01Z DEBUG fuse::request] OPEN(152) ino 0x0000000000000002, flags 0x8000
+[2019-11-05T11:16:01Z DEBUG fuse::request] READ(154) ino 0x0000000000000002, fh 0, offset 0, size 4096
+[2019-11-05T11:16:01Z DEBUG fuse::request] RELEASE(156) ino 0x0000000000000002, fh 0, flags 0x8000, release flags 0x0, lock owner 0
+[2019-11-05T11:16:01Z DEBUG fuse::request] GETATTR(158) ino 0x0000000000000001
+```
+
+## まとめ
+今回はシンボリックリンクとハードリンクの機能を作成しました。
+
+次回は、 後回しにしていた機能を実装します。
+
+# 後回しにしていた機能
+## 概要
+今まで基本的な操作を実装してきましたが、いくつかの機能を後回しにしていました。  
+せっかくなので、この辺りで実装していきます。
+
+## マウントオプション
+マウントオプションは `fuse::mount` の引数で指定します。

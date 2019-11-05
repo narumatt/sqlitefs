@@ -10,7 +10,7 @@ use fuse::{
     Request,
     FileType
 };
-use libc::{c_int, ENOENT, ENOTEMPTY, EISDIR, ENOTDIR};
+use libc::{c_int, ENOENT, ENOTEMPTY, EISDIR, ENOTDIR, EPERM, EEXIST, EINVAL, ENAMETOOLONG};
 use std::path::Path;
 use std::ffi::OsStr;
 use crate::db_module::{DbModule, DBFileAttr};
@@ -65,13 +65,14 @@ impl Filesystem for SqliteFs {
         let parent = parent as u32;
         let child = match self.db.lookup(parent, name.to_str().unwrap()) {
             Ok(n) => {
-                debug!("filesystem:lookup, return:{:?}", n.get_file_attr());
-                if n.ino == 0 {
-                    reply.error(ENOENT);
-                    return;
+                match n {
+                    Some(v) => {
+                        reply.entry(&ONE_SEC, &v.get_file_attr() , 0);
+                        debug!("filesystem:lookup, return:{:?}", v.get_file_attr());
+                        v.ino
+                    },
+                    None => { reply.error(ENOENT); return;}
                 }
-                reply.entry(&ONE_SEC, &n.get_file_attr() , 0);
-                n.ino
             },
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
@@ -99,8 +100,14 @@ impl Filesystem for SqliteFs {
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
         match self.db.get_inode(ino as u32) {
             Ok(n) => {
-                reply.attr(&ONE_SEC, &n.get_file_attr());
-                debug!("filesystem:getattr, return:{:?}", n.get_file_attr());
+                match n {
+                    Some(v) => {
+                        reply.attr(&ONE_SEC, &v.get_file_attr());
+                        debug!("filesystem:getattr, return:{:?}", v.get_file_attr());
+                    },
+                    None => reply.error(ENOENT)
+                }
+
             },
             Err(_err) => reply.error(ENOENT)
         };
@@ -124,7 +131,12 @@ impl Filesystem for SqliteFs {
         reply: ReplyAttr
     ) {
         let mut attr = match self.db.get_inode(ino as u32) {
-            Ok(n) => n,
+            Ok(n) => {
+                match n {
+                    Some(v) => v,
+                    None => {reply.error(ENOENT); return;}
+                }
+            },
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
         let old_size = attr.size;
@@ -142,6 +154,29 @@ impl Filesystem for SqliteFs {
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
         reply.attr(&ONE_SEC, &attr.get_file_attr());
+    }
+
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        let ino = ino as u32;
+        let attr = match self.db.get_inode(ino) {
+            Ok(n) => match n {
+                Some(attr) => attr,
+                None => {reply.error(ENOENT); return;}
+            },
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+
+        if attr.kind != FileType::Symlink {
+            reply.error(EINVAL);
+            return;
+        }
+        let size = attr.size;
+        let mut data = match self.db.get_data(ino as u32, 1, size) {
+            Ok(n) => n,
+            Err(_err) => {reply.error(ENOENT); return; }
+        };
+        data.resize(size as usize, 0);
+        reply.data(&data);
     }
 
     fn mkdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, reply: ReplyEntry) {
@@ -197,7 +232,12 @@ impl Filesystem for SqliteFs {
         let parent = parent as u32;
         let name = name.to_str().unwrap();
         let attr = match self.db.lookup(parent, name) {
-            Ok(n) => n,
+            Ok(n) => {
+                match n {
+                    Some(v) => v,
+                    None => {reply.error(ENOENT); return;}
+                }
+            },
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
         let empty = match self.db.check_directory_is_empty(attr.ino){
@@ -226,6 +266,46 @@ impl Filesystem for SqliteFs {
         reply.ok();
     }
 
+    fn symlink(&mut self, req: &Request, parent: u64, name: &OsStr, link: &Path, reply: ReplyEntry) {
+        let now = SystemTime::now();
+        let mut attr = DBFileAttr {
+            ino: 0,
+            size: 0,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            kind: FileType::Symlink,
+            perm: 0o777, // never used
+            nlink: 0,
+            uid: req.uid(),
+            gid: req.gid(),
+            rdev: 0,
+            flags: 0
+        };
+        let ino = match self.db.add_inode(parent as u32, name.to_str().unwrap(), &attr) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+        let data = link.to_str().unwrap().as_bytes();
+        let block_size = self.db.get_db_block_size() as usize;
+        if data.len() > block_size {
+            reply.error(ENAMETOOLONG);
+            return;
+        }
+        match self.db.write_data(ino, 1, &data, data.len() as u32) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        }
+        attr.ino = ino;
+        reply.entry(&ONE_SEC, &attr.get_file_attr(), 0);
+        let mut lc_list = self.lookup_count.lock().unwrap();
+        let lc = lc_list.entry(ino).or_insert(0);
+        *lc += 1;
+        debug!("filesystem:symlink, inode: {:?} lookup count:{:?}", ino, *lc);
+    }
+
     fn rename(
         &mut self,
         _req: &Request<'_>,
@@ -239,7 +319,7 @@ impl Filesystem for SqliteFs {
         let name = name.to_str().unwrap();
         let newparent = newparent as u32;
         let newname = newname.to_str().unwrap();
-        let ino =  match self.db.move_dentry(parent, name, newparent, newname) {
+        let entry =  match self.db.move_dentry(parent, name, newparent, newname) {
             Ok(n) => n,
             Err(err) => match err.kind() {
                 ErrorKind::FsNotEmpty {description} => {reply.error(ENOTEMPTY); debug!("{}", &description); return;},
@@ -248,7 +328,7 @@ impl Filesystem for SqliteFs {
                 _ => {reply.error(ENOENT); debug!("{}", err); return;},
             }
         };
-        if ino != 0 {
+        if let Some(ino) = entry {
             let lc_list = self.lookup_count.lock().unwrap();
             if !lc_list.contains_key(&ino) {
                 match self.db.delete_inode_if_noref(ino) {
@@ -258,6 +338,22 @@ impl Filesystem for SqliteFs {
             }
         }
         reply.ok();
+    }
+
+    fn link(&mut self, _req: &Request<'_>, ino: u64, newparent: u64, newname: &OsStr, reply: ReplyEntry) {
+        let attr = match self.db.link_dentry(ino as u32, newparent as u32, newname.to_str().unwrap()) {
+            Ok(n) => n,
+            Err(err) => match err.kind() {
+                ErrorKind::FsParm{description} => {reply.error(EPERM); debug!("{}", &description); return;},
+                ErrorKind::FsFileExist{description} => {reply.error(EEXIST); debug!("{}", &description); return;},
+                _ => {reply.error(ENOENT); debug!("{}", err); return;}
+            }
+        };
+        reply.entry(&ONE_SEC, &attr.get_file_attr(), 0);
+        let mut lc_list = self.lookup_count.lock().unwrap();
+        let lc = lc_list.entry(ino as u32).or_insert(0);
+        *lc += 1;
+        debug!("filesystem:link, lookup count:{:?}", *lc);
     }
 
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, reply: ReplyData) {
@@ -340,11 +436,12 @@ impl Filesystem for SqliteFs {
         let ino;
         let parent = parent as u32;
         let name = name.to_str().unwrap();
-        let mut attr = match self.db.lookup(parent, name) {
+        let lookup_result = match self.db.lookup(parent, name) {
             Ok(n) => n,
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
-        if attr.ino == 0 {
+        let mut attr: DBFileAttr;
+        if lookup_result.is_none() {
             let now = SystemTime::now();
             attr = DBFileAttr {
                 ino: 0,
@@ -373,6 +470,7 @@ impl Filesystem for SqliteFs {
             attr.ino = ino;
             debug!("filesystem:create, created:{:?}", attr);
         } else {
+            attr = lookup_result.unwrap();
             ino = attr.ino;
             debug!("filesystem:create, existed:{:?}", attr);
         }

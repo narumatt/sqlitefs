@@ -18,11 +18,7 @@
 - flush
 - release
 - fsync
-- readlink
 - mknod
-- symlink
-- rename
-- link
 - opendir
 - releasedir
 - fsyncdir
@@ -38,10 +34,10 @@
 
 
 - sgid対応
-- シンボリックリンクにrmdirしたときの動作
 - O_APPEND
 - direct_io
 - マウントオプションの処理
+- タイムスタンプの処理
 
 ## 参考リンク
 
@@ -53,13 +49,13 @@
 
 [FUSEプロトコルの説明](https://john-millikin.com/the-fuse-protocol) : カーネルモジュール <-> Fuseライブラリ間のプロトコル
 
-[VFSの説明](http://archive.linux.or.jp/JF/JFdocs/Linux-Kernel-Internals-3.html)
+[VFSの説明](https://ja.osdn.net/projects/linuxjf/wiki/vfs.txt)
 
 [lowlevel関数の説明(libfuseのヘッダ)](https://github.com/libfuse/libfuse/blob/master/include/fuse_lowlevel.h)
 
 [ファイルオープン時のもろもろの説明(libfuseのヘッダ)](https://github.com/libfuse/libfuse/blob/master/include/fuse_common.h)
 
-[Linuxプログラミングインターフェース(書籍)](https://www.oreilly.co.jp/books/9784873115856/)
+[Linuxプログラミングインターフェース(書籍)](https://www.oreilly.co.jp/books/9784873115856/) : システムコールの満たすべき要件
 
 [libfuseのメーリングリストのアーカイブ](https://sourceforge.net/p/fuse/mailman/fuse-devel/)
 

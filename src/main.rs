@@ -55,5 +55,8 @@ fn main() {
         Ok(n) => n,
         Err(err) => {println!("{:?}", err); return;}
     };
-    fuse::mount(fs, &mountpoint, &options).unwrap();
+    match fuse::mount(fs, &mountpoint, &options) {
+        Ok(n) => n,
+        Err(err) => error!("{}", err)
+    }
 }

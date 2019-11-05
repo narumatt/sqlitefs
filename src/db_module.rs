@@ -1,13 +1,13 @@
 pub mod sqlite;
 use std::time::SystemTime;
-use crate::sqerror::{Error, Result};
+use crate::sqerror::Result;
 use fuse::{FileAttr, FileType};
 use time::Timespec;
 use chrono::{DateTime, Utc, NaiveDateTime};
 
 pub trait DbModule {
-    /// Get file metadata. If not found, return an attribute which inode is 0
-    fn get_inode(&self, inode: u32) -> Result<DBFileAttr>;
+    /// Get file metadata. If not found, return None
+    fn get_inode(&self, inode: u32) -> Result<Option<DBFileAttr>>;
     /// Add file or directory.
     fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32>;
     /// Update file metadata.
@@ -16,15 +16,17 @@ pub trait DbModule {
     fn delete_inode_if_noref(&mut self, inode: u32) -> Result<()>;
     /// Get directory entries
     fn get_dentry(&self, inode: u32) -> Result<Vec<DEntry>>;
+    /// Add new directory entry which is hard link
+    fn link_dentry(&mut self, inode: u32, parent: u32, name: &str) -> Result<DBFileAttr>;
     /// Delete dentry. returns target inode.
     fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32>;
-    /// Move dentry to another parent or name. Return nonzero inode if new file is overwrote.
-    fn move_dentry(&mut self, parent: u32, name: &str, new_parent: u32, new_name: &str) -> Result<u32>;
+    /// Move dentry to another parent or name. Return some inode number if new file is overwrote.
+    fn move_dentry(&mut self, parent: u32, name: &str, new_parent: u32, new_name: &str) -> Result<Option<u32>>;
     /// check directory is empty.
     fn check_directory_is_empty(&self, inode: u32) -> Result<bool>;
     /// lookup a directory entry table and get a file attribute.
-    /// If not found, return an attribute which inode is 0
-    fn lookup(&self, parent: u32, name: &str) -> Result<DBFileAttr>;
+    /// If not found, return None
+    fn lookup(&self, parent: u32, name: &str) -> Result<Option<DBFileAttr>>;
     /// Read data from whole block.
     fn get_data(&mut self, inode: u32, block: u32, length: u32) -> Result<Vec<u8>>;
     /// Write data into whole block.

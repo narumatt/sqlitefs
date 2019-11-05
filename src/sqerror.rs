@@ -23,6 +23,10 @@ pub enum ErrorKind {
     FsNoEnt{description: String},
     #[fail(display = "Target is not empty: {}", description)]
     FsNotEmpty{description: String},
+    #[fail(display = "Target file is already exist: {}", description)]
+    FsFileExist{description: String},
+    #[fail(display = "Invalid argument: {}", description)]
+    FsParm{description: String},
     #[fail(display = "Undefined error: {}", description)]
     Undefined{description: String},
 }
