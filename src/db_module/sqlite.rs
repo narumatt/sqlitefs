@@ -7,13 +7,13 @@ use crate::db_module::{DbModule, DBFileAttr, DEntry};
 use crate::sqerror::{Error, Result, ErrorKind};
 use fuse::FileType;
 
-const DB_IFIFO: u32 = 0o0010000;
-const DB_IFCHR: u32 = 0o0020000;
-const DB_IFDIR: u32 = 0o0040000;
-const DB_IFBLK: u32 = 0o0060000;
-const DB_IFREG: u32 = 0o0100000;
-const DB_IFLNK: u32 = 0o0120000;
-const DB_IFSOCK: u32 = 0o0140000;
+const DB_IFIFO: u32 = 0o0_010_000;
+const DB_IFCHR: u32 = 0o0_020_000;
+const DB_IFDIR: u32 = 0o0_040_000;
+const DB_IFBLK: u32 = 0o0_060_000;
+const DB_IFREG: u32 = 0o0_100_000;
+const DB_IFLNK: u32 = 0o0_120_000;
+const DB_IFSOCK: u32 = 0o0_140_000;
 
 const BLOCK_SIZE: u32 = 4096;
 
@@ -156,7 +156,7 @@ fn parse_attr(mut stmt: Statement, params: &[&dyn ToSql]) -> Result<Option<DBFil
     for row in rows {
         attrs.push(row?);
     }
-    if attrs.len() == 0 {
+    if attrs.is_empty() {
         Ok(None)
     } else {
         Ok(Some(attrs[0]))
@@ -477,12 +477,11 @@ impl DbModule for Sqlite {
         };
         let now = Utc::now();
         let atime = DateTime::<Utc>::from(attr.atime);
-        let mtime;
-        if oldattr.size != attr.size {
-            mtime = now;
-        } else {
-            mtime = DateTime::<Utc>::from(attr.mtime);
-        }
+        let mtime= if oldattr.size != attr.size {
+                now
+            } else {
+                DateTime::<Utc>::from(attr.mtime)
+            };
         let ctime = now;
         let crtime = DateTime::<Utc>::from(attr.crtime);
         {

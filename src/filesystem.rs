@@ -268,11 +268,11 @@ impl Filesystem for SqliteFs {
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
         if parent_attr.perm & S_ISGID as u16 > 0 {
-            attr.perm = attr.perm | S_ISGID as u16;
+            attr.perm |= S_ISGID as u16;
             attr.gid = parent_attr.gid;
         }
         if parent_attr.perm & S_ISVTX as u16 > 0 {
-            attr.perm = attr.perm | S_ISVTX as u16;
+            attr.perm |= S_ISVTX as u16;
         }
         let ino =  match self.db.add_inode_and_dentry(parent, name.to_str().unwrap(), &attr) {
             Ok(n) => n,
@@ -446,7 +446,7 @@ impl Filesystem for SqliteFs {
             stat.noatime = true;
         }
         let mut handler = self.open_file_handler.lock().unwrap();
-        let handle_list = handler.entry(ino).or_insert(OpenFileHandler::new());
+        let handle_list = handler.entry(ino).or_insert_with(OpenFileHandler::new);
         let fh = handle_list.count;
         (*handle_list).list.insert(fh, stat);
         (*handle_list).count += 1;
@@ -517,7 +517,7 @@ impl Filesystem for SqliteFs {
     fn release(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _flags: u32, _lock_owner: u64, _flush: bool, reply: ReplyEmpty) {
         let ino = ino as u32;
         let mut handler = self.open_file_handler.lock().unwrap();
-        let handle_list = handler.entry(ino).or_insert(OpenFileHandler::new());
+        let handle_list = handler.entry(ino).or_insert_with(OpenFileHandler::new);
         (*handle_list).list.remove(&fh);
         if (*handle_list).count == 0 {
             handler.remove(&ino);
@@ -532,7 +532,7 @@ impl Filesystem for SqliteFs {
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
         let mut handler = self.open_dir_handler.lock().unwrap();
-        let handle_list = handler.entry(ino).or_insert(OpenDirHandler::new());
+        let handle_list = handler.entry(ino).or_insert_with(OpenDirHandler::new);
         let fh = handle_list.count;
         (*handle_list).list.insert(fh, dentries);
         (*handle_list).count += 1;
@@ -554,7 +554,7 @@ impl Filesystem for SqliteFs {
             None => {reply.error(ENOENT); return;}
         };
 
-        for (i, entry) in db_entries.into_iter().enumerate().skip(offset as usize) {
+        for (i, entry) in db_entries.iter().enumerate().skip(offset as usize) {
             let full = reply.add(entry.child_ino as u64, (i + 1) as i64, entry.file_type, &entry.filename);
             if full {
                 break;
@@ -567,7 +567,7 @@ impl Filesystem for SqliteFs {
     fn releasedir(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _flags: u32, reply: ReplyEmpty) {
         let ino = ino as u32;
         let mut handler = self.open_dir_handler.lock().unwrap();
-        let handle_list = handler.entry(ino).or_insert(OpenDirHandler::new());
+        let handle_list = handler.entry(ino).or_insert_with(OpenDirHandler::new);
         (*handle_list).list.remove(&fh);
         if (*handle_list).count == 0 {
             handler.remove(&ino);
@@ -599,46 +599,56 @@ impl Filesystem for SqliteFs {
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
         let mut attr: DBFileAttr;
-        if lookup_result.is_none() {
-            let parent_attr = match self.db.get_inode(parent) {
-                Ok(n) => match n {
-                    Some(n) => n,
-                    None => {reply.error(ENOENT); return;}
-                },
-                Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
-            };
-            let now = SystemTime::now();
-            attr = DBFileAttr {
-                ino: 0,
-                size: 0,
-                blocks: 0,
-                atime: now,
-                mtime: now,
-                ctime: now,
-                crtime: now,
-                kind: FileType::RegularFile,
-                perm: mode as u16,
-                nlink: 0,
-                uid: req.uid(),
-                gid: if parent_attr.perm & S_ISGID as u16 > 0 {parent_attr.gid} else {req.gid()},
-                rdev: 0,
-                flags: 0
-            };
-            ino = match self.db.add_inode_and_dentry(parent, name, &attr) {
-                Ok(n) => n,
-                Err(err) => {
-                    reply.error(ENOENT);
-                    debug!("{}", err);
-                    return;
-                }
-            };
-            attr.ino = ino;
-            debug!("filesystem:create, created:{:?}", attr);
-        } else {
-            attr = lookup_result.unwrap();
-            ino = attr.ino;
-            debug!("filesystem:create, existed:{:?}", attr);
-        }
+        match lookup_result {
+            None => {
+                let parent_attr = match self.db.get_inode(parent) {
+                    Ok(n) => match n {
+                        Some(n) => n,
+                        None => {
+                            reply.error(ENOENT);
+                            return;
+                        }
+                    },
+                    Err(err) => {
+                        reply.error(ENOENT);
+                        debug!("{}", err);
+                        return;
+                    }
+                };
+                let now = SystemTime::now();
+                attr = DBFileAttr {
+                    ino: 0,
+                    size: 0,
+                    blocks: 0,
+                    atime: now,
+                    mtime: now,
+                    ctime: now,
+                    crtime: now,
+                    kind: FileType::RegularFile,
+                    perm: mode as u16,
+                    nlink: 0,
+                    uid: req.uid(),
+                    gid: if parent_attr.perm & S_ISGID as u16 > 0 { parent_attr.gid } else { req.gid() },
+                    rdev: 0,
+                    flags: 0
+                };
+                ino = match self.db.add_inode_and_dentry(parent, name, &attr) {
+                    Ok(n) => n,
+                    Err(err) => {
+                        reply.error(ENOENT);
+                        debug!("{}", err);
+                        return;
+                    }
+                };
+                attr.ino = ino;
+                debug!("filesystem:create, created:{:?}", attr);
+            },
+            Some(n) => {
+                attr = n;
+                ino = attr.ino;
+                debug!("filesystem:create, existed:{:?}", attr);
+            }
+        };
         let mut lc_list = self.lookup_count.lock().unwrap();
         let lc = lc_list.entry(ino).or_insert(0);
         *lc += 1;
