@@ -11,7 +11,7 @@ CREATE TABLE metadata(
             ctime_nsec int,
             crtime text,
             crtime_nsec int,
-            kind int,	
+            kind int,
             mode int,
             nlink int default 0 not null,
             uid int default 0,
@@ -19,7 +19,7 @@ CREATE TABLE metadata(
             rdev int default 0,
             flags int default 0
             );
-INSERT INTO metadata VALUES(1,0,'2019-10-21 05:19:50',991989258,'2019-10-21 05:19:50',991989258,'2019-10-21 05:19:50',991989258,'2019-10-21 05:19:50',991989258,16384,16832,1,0,0,0,0);
+INSERT INTO metadata VALUES(1,0,'1970-01-01 00:00:00',0,'1970-01-01 00:00:00',0,'1970-01-01 00:00:00',0,'1970-01-01 00:00:00',0,16384,16832,1,0,0,0,0);
 CREATE TABLE data(
             file_id int,
             block_num int,

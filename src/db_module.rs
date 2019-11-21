@@ -6,14 +6,16 @@ use time::Timespec;
 use chrono::{DateTime, Utc, NaiveDateTime};
 
 pub trait DbModule {
+    /// Create tables (if not found) and add root directory (if not found)
+    fn init(&mut self) -> Result<()>;
     /// Get metadata. If not found, return None
     fn get_inode(&self, inode: u32) -> Result<Option<DBFileAttr>>;
     /// Add a file or a directory.
     /// Update atime, mtime, ctime. Update mtime and ctime of the parent directory.
-    fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32>;
+    fn add_inode_and_dentry(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32>;
     /// Update file metadata.
     /// Update ctime. Update mtime if filesize is changed.
-    fn update_inode(&mut self, attr: DBFileAttr, truncate: bool) -> Result<()>;
+    fn update_inode(&mut self, attr: &DBFileAttr, truncate: bool) -> Result<()>;
     // Delete an inode if the link count is zero.
     fn delete_inode_if_noref(&mut self, inode: u32) -> Result<()>;
     /// Get directory entries

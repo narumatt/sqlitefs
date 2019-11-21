@@ -239,26 +239,8 @@ fn check_directory_is_empty_local(inode: u32, tx: &Connection) -> Result<bool> {
     Ok(true)
 }
 
-pub struct Sqlite {
-    conn: Connection
-}
-
-impl Sqlite {
-    pub fn new(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        // enable foreign key. Sqlite ignores foreign key by default.
-        conn.execute("PRAGMA foreign_keys=ON", NO_PARAMS)?;
-        Ok(Sqlite { conn })
-    }
-}
-
-impl DbModule for Sqlite {
-    fn get_inode(&self, inode: u32) -> Result<Option<DBFileAttr>> {
-        get_inode_local(inode, &self.conn)
-    }
-
-    fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32> {
-        let sql = "INSERT INTO metadata \
+fn add_inode_local(attr: &DBFileAttr, tx: &Connection) -> Result<u32> {
+    let sql = "INSERT INTO metadata \
             (size,\
             atime,\
             atime_nsec,\
@@ -277,13 +259,12 @@ impl DbModule for Sqlite {
             flags\
             ) \
             VALUES($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)";
-        let atime = DateTime::<Utc>::from(attr.atime);
-        let mtime = DateTime::<Utc>::from(attr.mtime);
-        let ctime = DateTime::<Utc>::from(attr.ctime);
-        let crtime = DateTime::<Utc>::from(attr.crtime);
-        let tx = self.conn.transaction()?;
-        {
-            tx.execute(sql, params![
+    let atime = DateTime::<Utc>::from(attr.atime);
+    let mtime = DateTime::<Utc>::from(attr.mtime);
+    let ctime = DateTime::<Utc>::from(attr.ctime);
+    let crtime = DateTime::<Utc>::from(attr.crtime);
+    {
+        tx.execute(sql, params![
             attr.size,
             atime.format("%Y-%m-%d %H:%M:%S").to_string(),
             atime.timestamp_subsec_nanos(),
@@ -301,13 +282,155 @@ impl DbModule for Sqlite {
             attr.rdev,
             attr.flags,
         ])?;
-        }
-        let sql = "SELECT last_insert_rowid()";
-        let child: u32;
+    }
+    let sql = "SELECT last_insert_rowid()";
+    let child: u32;
+    {
+        let mut stmt = tx.prepare(sql)?;
+        child = stmt.query_row(params![], |row| row.get(0))?;
+    }
+    Ok(child)
+}
+
+
+pub struct Sqlite {
+    conn: Connection
+}
+
+impl Sqlite {
+    pub fn new(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        // enable foreign key. Sqlite ignores foreign key by default.
+        conn.execute("PRAGMA foreign_keys=ON", NO_PARAMS)?;
+        Ok(Sqlite { conn })
+    }
+
+    pub fn new_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        // enable foreign key. Sqlite ignores foreign key by default.
+        conn.execute("PRAGMA foreign_keys=ON", NO_PARAMS)?;
+        Ok(Sqlite { conn })
+    }
+}
+
+impl DbModule for Sqlite {
+    fn init(&mut self) -> Result<()> {
+        let table_search_sql = "SELECT count(name) FROM sqlite_master WHERE type='table' AND name=$1";
         {
-            let mut stmt = tx.prepare(sql)?;
-            child = stmt.query_row(params![], |row| row.get(0))?;
+            let row_count: u32 = self.conn.query_row(table_search_sql, params!["metadata"], |row| row.get(0) )?;
+            if row_count == 0 {
+                let sql = "CREATE TABLE metadata(\
+                    id integer primary key,\
+                    size int default 0 not null,\
+                    atime text,\
+                    atime_nsec int,\
+                    mtime text,\
+                    mtime_nsec int,\
+                    ctime text,\
+                    ctime_nsec int,\
+                    crtime text,\
+                    crtime_nsec int,\
+                    kind int,\
+                    mode int,\
+                    nlink int default 0 not null,\
+                    uid int default 0,\
+                    gid int default 0,\
+                    rdev int default 0,\
+                    flags int default 0 \
+                    )";
+                let res = self.conn.execute(sql, params![])?;
+                debug!("metadata table: {}", res);
+            }
         }
+        {
+            let row_count: u32 = self.conn.query_row(table_search_sql, params!["dentry"], |row| row.get(0) )?;
+            if row_count == 0 {
+                let sql = "CREATE TABLE dentry(\
+                    parent_id int,\
+                    child_id int,\
+                    file_type int,\
+                    name text,\
+                    foreign key (parent_id) references metadata(id) on delete cascade,\
+                    foreign key (child_id) references metadata(id) on delete cascade,\
+                    primary key (parent_id, name) \
+                    )";
+                self.conn.execute(sql, params![])?;
+            }
+        }
+        {
+            let row_count: u32 = self.conn.query_row(table_search_sql, params!["data"], |row| row.get(0) )?;
+            if row_count == 0 {
+                let sql = "CREATE TABLE data(\
+                    file_id int,\
+                    block_num int,\
+                    data blob,\
+                    foreign key (file_id) references metadata(id) on delete cascade,\
+                    primary key (file_id, block_num) \
+                    )";
+                self.conn.execute(sql, params![])?;
+            }
+        }
+        {
+            let sql = "SELECT count(id) FROM metadata WHERE id=1";
+            let row_count: u32 = self.conn.query_row(sql, params![], |row| row.get(0) )?;
+            if row_count == 0 {
+                let now = SystemTime::now();
+                let root_dir = DBFileAttr {
+                    ino: 1,
+                    size: 0,
+                    blocks: 0,
+                    atime: now,
+                    mtime: now,
+                    ctime: now,
+                    crtime: now,
+                    kind: FileType::Directory,
+                    perm: 0o40777,
+                    nlink: 0,
+                    uid: 0,
+                    gid: 0,
+                    rdev: 0,
+                    flags: 0
+                };
+                add_inode_local(&root_dir, &self.conn)?;
+                inclease_nlink(1, &self.conn)?;
+            }
+        }
+        {
+            let sql = "SELECT count(parent_id) FROM dentry WHERE parent_id=1 and name='.'";
+            let row_count: u32 = self.conn.query_row(sql, params![], |row| row.get(0) )?;
+            if row_count == 0 {
+                let root_dir = DEntry{
+                    parent_ino: 1,
+                    child_ino: 1,
+                    file_type: FileType::Directory,
+                    filename: ".".to_string()
+                };
+                add_dentry(root_dir, &self.conn)?;
+            }
+        }
+        {
+            let sql = "SELECT count(parent_id) FROM dentry WHERE parent_id=1 and name='..'";
+            let row_count: u32 = self.conn.query_row(sql, params![], |row| row.get(0) )?;
+            if row_count == 0 {
+                let root_dir = DEntry{
+                    parent_ino: 1,
+                    child_ino: 1,
+                    file_type: FileType::Directory,
+                    filename: "..".to_string()
+                };
+                add_dentry(root_dir, &self.conn)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn get_inode(&self, inode: u32) -> Result<Option<DBFileAttr>> {
+        get_inode_local(inode, &self.conn)
+    }
+
+    fn add_inode_and_dentry(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32> {
+        let tx = self.conn.transaction()?;
+        let child = add_inode_local(attr, &tx)?;
         let dentry = DEntry{parent_ino: parent, child_ino: child, filename: String::from(name), file_type: attr.kind};
         add_dentry(dentry, &tx)?;
         inclease_nlink(child, &tx)?;
@@ -324,7 +447,7 @@ impl DbModule for Sqlite {
         Ok(child)
     }
 
-    fn update_inode(&mut self, attr: DBFileAttr, truncate: bool) -> Result<()> {
+    fn update_inode(&mut self, attr: &DBFileAttr, truncate: bool) -> Result<()> {
         let sql = "UPDATE metadata SET \
             size=$1,\
             atime=datetime($2),\
@@ -542,6 +665,10 @@ impl DbModule for Sqlite {
             res = Some(v.child_ino);
         }
         tx.execute(sql, params![new_parent, new_name, parent, name])?;
+        if parent != new_parent && dentry.file_type == FileType::Directory {
+            let sql = "UPDATE dentry set child_id=$1 WHERE parent_id=$2 and name='..'";
+            tx.execute(sql, params![new_parent, dentry.child_ino])?;
+        }
         update_ctime(dentry.child_ino, now, &tx)?;
         update_mtime(parent, now, &tx)?;
         update_ctime(parent, now, &tx)?;

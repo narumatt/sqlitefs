@@ -7,38 +7,101 @@ use fuse::{
     ReplyWrite,
     ReplyCreate,
     ReplyEmpty,
+    ReplyOpen,
+    ReplyStatfs,
     Request,
     FileType
 };
-use libc::{c_int, ENOENT, ENOTEMPTY, EISDIR, ENOTDIR, EPERM, EEXIST, EINVAL, ENAMETOOLONG};
+use libc::{
+    c_int,
+    ENOENT,
+    ENOTEMPTY,
+    EISDIR,
+    ENOTDIR,
+    EPERM,
+    EEXIST,
+    EINVAL,
+    ENAMETOOLONG,
+    O_RDONLY,
+    O_APPEND,
+    O_NOATIME,
+    S_ISGID,
+    S_ISVTX
+};
+use nix::sys::statvfs;
 use std::path::Path;
 use std::ffi::OsStr;
-use crate::db_module::{DbModule, DBFileAttr};
+use crate::db_module::{DbModule, DBFileAttr, DEntry};
 use crate::db_module::sqlite::Sqlite;
 use crate::sqerror::{Error, ErrorKind};
 use time::Timespec;
 use std::time::SystemTime;
 use std::sync::Mutex;
 use std::collections::HashMap;
-
 const ONE_SEC: Timespec = Timespec{
     sec: 1,
     nsec: 0
 };
 
+struct OpenFileStat {
+    readonly: bool,
+    append: bool,
+    noatime: bool,
+}
+
+struct OpenFileHandler {
+    count : u64,
+    list: HashMap<u64, OpenFileStat>,
+}
+
+impl OpenFileStat {
+    fn new() -> Self {
+        Self{readonly: false, append: false, noatime: false}
+    }
+}
+
+impl OpenFileHandler {
+    fn new() -> Self {
+        Self{count: 0, list: HashMap::<u64, OpenFileStat>::new()}
+    }
+}
+
+struct OpenDirHandler {
+    count: u64,
+    list: HashMap<u64, Vec<DEntry>>,
+}
+
+impl OpenDirHandler {
+    fn new() -> Self {
+        Self{count: 0, list: HashMap::<u64, Vec<DEntry>>::new()}
+    }
+}
+
 pub struct SqliteFs{
     db: Sqlite,
-    lookup_count: Mutex<HashMap<u32, u32>>
+    lookup_count: Mutex<HashMap<u32, u32>>,
+    open_file_handler: Mutex<HashMap<u32, OpenFileHandler>>,
+    open_dir_handler: Mutex<HashMap<u32, OpenDirHandler>>,
 }
 
 impl SqliteFs {
-    pub fn new(path: &str) -> Result<SqliteFs, Error> {
-        let db = match Sqlite::new(Path::new(path)) {
+    pub fn new(path: & str) -> Result<SqliteFs, Error> {
+        let mut db = match Sqlite::new(Path::new(path)) {
             Ok(n) => n,
             Err(err) => return Err(err)
         };
+        db.init()?;
         let lookup_count = Mutex::new(HashMap::<u32, u32>::new());
-        Ok(SqliteFs{db, lookup_count})
+        let open_file_handler = Mutex::new(HashMap::<u32, OpenFileHandler>::new());
+        let open_dir_handler = Mutex::new(HashMap::<u32, OpenDirHandler>::new());
+        Ok(SqliteFs{db, lookup_count, open_file_handler, open_dir_handler})
+    }
+
+    pub fn new_with_db(db: Sqlite) -> Result<SqliteFs, Error> {
+        let lookup_count = Mutex::new(HashMap::<u32, u32>::new());
+        let open_file_handler = Mutex::new(HashMap::<u32, OpenFileHandler>::new());
+        let open_dir_handler = Mutex::new(HashMap::<u32, OpenDirHandler>::new());
+        Ok(SqliteFs{db, lookup_count, open_file_handler, open_dir_handler})
     }
 }
 
@@ -88,7 +151,7 @@ impl Filesystem for SqliteFs {
         let lc = lc_list.entry(ino).or_insert(0);
         *lc -= nlookup as u32;
         debug!("filesystem:forget, lookup count:{:?}", *lc);
-        if *lc <= 0 {
+        if *lc == 0 {
             lc_list.remove(&ino);
             match self.db.delete_inode_if_noref(ino) {
                 Ok(n) => n,
@@ -148,7 +211,7 @@ impl Filesystem for SqliteFs {
         if let Some(n) = mtime {attr.mtime = attr.datetime_from(&n)};
         if let Some(n) = crtime {attr.crtime = attr.datetime_from(&n)};
         if let Some(n) = flags {attr.flags = n};
-        match self.db.update_inode(attr, old_size > attr.size) {
+        match self.db.update_inode(&attr, old_size > attr.size) {
             Ok(_n) => (),
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
@@ -180,6 +243,7 @@ impl Filesystem for SqliteFs {
 
     fn mkdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, reply: ReplyEntry) {
         let now = SystemTime::now();
+        let parent = parent as u32;
         let mut attr = DBFileAttr {
             ino: 0,
             size: 0,
@@ -196,7 +260,21 @@ impl Filesystem for SqliteFs {
             rdev: 0,
             flags: 0
         };
-        let ino =  match self.db.add_inode(parent as u32, name.to_str().unwrap(), &attr) {
+        let parent_attr = match self.db.get_inode(parent) {
+            Ok(n) => match n {
+                Some(n) => n,
+                None => {reply.error(ENOENT); return;}
+            },
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+        if parent_attr.perm & S_ISGID as u16 > 0 {
+            attr.perm = attr.perm | S_ISGID as u16;
+            attr.gid = parent_attr.gid;
+        }
+        if parent_attr.perm & S_ISVTX as u16 > 0 {
+            attr.perm = attr.perm | S_ISVTX as u16;
+        }
+        let ino =  match self.db.add_inode_and_dentry(parent, name.to_str().unwrap(), &attr) {
             Ok(n) => n,
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
@@ -283,7 +361,7 @@ impl Filesystem for SqliteFs {
             rdev: 0,
             flags: 0
         };
-        let ino = match self.db.add_inode(parent as u32, name.to_str().unwrap(), &attr) {
+        let ino = match self.db.add_inode_and_dentry(parent as u32, name.to_str().unwrap(), &attr) {
             Ok(n) => n,
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
@@ -355,6 +433,26 @@ impl Filesystem for SqliteFs {
         debug!("filesystem:link, lookup count:{:?}", *lc);
     }
 
+    fn open(&mut self, _req: &Request<'_>, ino: u64, flags: u32, reply: ReplyOpen) {
+        let ino = ino as u32;
+        let mut stat = OpenFileStat::new();
+        if flags & O_APPEND as u32 > 0 {
+            stat.append = true;
+        }
+        if flags & O_RDONLY as u32 > 0 {
+            stat.readonly = true;
+        }
+        if flags & O_NOATIME as u32 > 0 {
+            stat.noatime = true;
+        }
+        let mut handler = self.open_file_handler.lock().unwrap();
+        let handle_list = handler.entry(ino).or_insert(OpenFileHandler::new());
+        let fh = handle_list.count;
+        (*handle_list).list.insert(fh, stat);
+        (*handle_list).count += 1;
+        reply.opened(fh, 0);
+    }
+
     fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, size: u32, reply: ReplyData) {
         let mut data: Vec<u8> = Vec::with_capacity(size as usize);
         let block_size = self.db.get_db_block_size();
@@ -416,11 +514,46 @@ impl Filesystem for SqliteFs {
         reply.written(size);
     }
 
-    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-        let db_entries = match self.db.get_dentry(ino as u32) {
+    fn release(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _flags: u32, _lock_owner: u64, _flush: bool, reply: ReplyEmpty) {
+        let ino = ino as u32;
+        let mut handler = self.open_file_handler.lock().unwrap();
+        let handle_list = handler.entry(ino).or_insert(OpenFileHandler::new());
+        (*handle_list).list.remove(&fh);
+        if (*handle_list).count == 0 {
+            handler.remove(&ino);
+        }
+        reply.ok();
+    }
+
+    fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: u32, reply: ReplyOpen) {
+        let ino = ino as u32;
+        let dentries = match self.db.get_dentry(ino) {
             Ok(n) => n,
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
+        let mut handler = self.open_dir_handler.lock().unwrap();
+        let handle_list = handler.entry(ino).or_insert(OpenDirHandler::new());
+        let fh = handle_list.count;
+        (*handle_list).list.insert(fh, dentries);
+        (*handle_list).count += 1;
+        reply.opened(fh, 0);
+    }
+
+    fn readdir(&mut self, _req: &Request, ino: u64, fh: u64, offset: i64, mut reply: ReplyDirectory) {
+        /*let db_entries = match self.db.get_dentry(ino as u32) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };*/
+        let ino = ino as u32;
+        let handler = self.open_dir_handler.lock().unwrap();
+        let db_entries: &Vec<DEntry> = match match handler.get(&ino) {
+            Some(n) => n.list.get(&fh),
+            None => None,
+        } {
+            Some(n) => n,
+            None => {reply.error(ENOENT); return;}
+        };
+
         for (i, entry) in db_entries.into_iter().enumerate().skip(offset as usize) {
             let full = reply.add(entry.child_ino as u64, (i + 1) as i64, entry.file_type, &entry.filename);
             if full {
@@ -429,6 +562,32 @@ impl Filesystem for SqliteFs {
             debug!("filesystem:readdir, ino: {:?} offset: {:?} kind: {:?} name: {}", entry.child_ino as u64, (i + 1) as i64, entry.file_type, entry.filename);
         }
         reply.ok();
+    }
+
+    fn releasedir(&mut self, _req: &Request<'_>, ino: u64, fh: u64, _flags: u32, reply: ReplyEmpty) {
+        let ino = ino as u32;
+        let mut handler = self.open_dir_handler.lock().unwrap();
+        let handle_list = handler.entry(ino).or_insert(OpenDirHandler::new());
+        (*handle_list).list.remove(&fh);
+        if (*handle_list).count == 0 {
+            handler.remove(&ino);
+        }
+        reply.ok();
+    }
+
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        let stat = statvfs::statvfs("/").unwrap();
+        reply.statfs(
+            stat.blocks(),
+            stat.blocks_free(),
+            stat.blocks_available(),
+            stat.files(),
+            stat.files_free(),
+            stat.block_size() as u32,
+            stat.name_max() as u32,
+            stat.fragment_size() as u32
+        );
+        debug!("statfs {:?}", stat);
     }
 
     fn create(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _flags: u32, reply: ReplyCreate) {
@@ -441,6 +600,13 @@ impl Filesystem for SqliteFs {
         };
         let mut attr: DBFileAttr;
         if lookup_result.is_none() {
+            let parent_attr = match self.db.get_inode(parent) {
+                Ok(n) => match n {
+                    Some(n) => n,
+                    None => {reply.error(ENOENT); return;}
+                },
+                Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+            };
             let now = SystemTime::now();
             attr = DBFileAttr {
                 ino: 0,
@@ -454,11 +620,11 @@ impl Filesystem for SqliteFs {
                 perm: mode as u16,
                 nlink: 0,
                 uid: req.uid(),
-                gid: req.gid(),
+                gid: if parent_attr.perm & S_ISGID as u16 > 0 {parent_attr.gid} else {req.gid()},
                 rdev: 0,
                 flags: 0
             };
-            ino = match self.db.add_inode(parent, name, &attr) {
+            ino = match self.db.add_inode_and_dentry(parent, name, &attr) {
                 Ok(n) => n,
                 Err(err) => {
                     reply.error(ENOENT);
