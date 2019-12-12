@@ -371,6 +371,19 @@ impl DbModule for Sqlite {
             }
         }
         {
+            let row_count: u32 = self.conn.query_row(table_search_sql, params!["xattr"], |row| row.get(0) )?;
+            if row_count == 0 {
+                let sql = "CREATE TABLE xattr(\
+                    file_id int,\
+                    name text,\
+                    value text,\
+                    foreign key (file_id) references metadata(id) on delete cascade,\
+                    primary key (file_id, name) \
+                    )";
+                self.conn.execute(sql, params![])?;
+            }
+        }
+        {
             let sql = "SELECT count(id) FROM metadata WHERE id=1";
             let row_count: u32 = self.conn.query_row(sql, params![], |row| row.get(0) )?;
             if row_count == 0 {
@@ -774,5 +787,67 @@ impl DbModule for Sqlite {
 
     fn get_db_block_size(&self) -> u32 {
         BLOCK_SIZE
+    }
+
+    fn set_xattr(&mut self, inode: u32, key: &str, value: &[u8]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            tx.execute("REPLACE INTO xattr \
+            (file_id, name, value)
+            VALUES($1, $2, $3)",
+                       params![inode, key, value])?;
+        }
+        let time = Utc::now();
+        update_ctime(inode, time, &tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn get_xattr(&self, inode: u32, key: &str) -> Result<Vec<u8>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT \
+            value FROM xattr WHERE file_id=$1 AND name=$2")?;
+        let row: Vec<u8> = match stmt.query_row(params![inode, key], |row| row.get(0)) {
+            Ok(n) => n,
+            Err(err) => {
+                if err == rusqlite::Error::QueryReturnedNoRows {
+                    return Err(Error::from(ErrorKind::FsNoEnt {
+                        description: format!(
+                            "inode: {} name:{}",
+                            inode, key
+                        )
+                    }))
+                } else {
+                    return Err(Error::from(err))
+                }
+            }
+        };
+        Ok(row)
+    }
+
+    fn list_xattr(&self, inode: u32) -> Result<Vec<String>> {
+        let sql = "SELECT name FROM xattr WHERE file_id=$1 ORDER BY name";
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![inode], |row| {
+            Ok(row.get(0)?)
+        })?;
+        let mut name_list: Vec<String> = Vec::new();
+        for row in rows {
+            name_list.push(row?);
+        }
+        Ok(name_list)
+    }
+
+    fn delete_xattr(&mut self, inode: u32, key: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            tx.execute("DELETE FROM xattr \
+            WHERE file_id = $1 AND name = $2",
+                       params![inode, key])?;
+        }
+        let time = Utc::now();
+        update_ctime(inode, time, &tx)?;
+        tx.commit()?;
+        Ok(())
     }
 }

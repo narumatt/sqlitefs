@@ -9,6 +9,7 @@ use fuse::{
     ReplyEmpty,
     ReplyOpen,
     ReplyStatfs,
+    ReplyXattr,
     Request,
     FileType
 };
@@ -22,11 +23,15 @@ use libc::{
     EEXIST,
     EINVAL,
     ENAMETOOLONG,
+    ENODATA,
+    ERANGE,
     O_RDONLY,
     O_APPEND,
     O_NOATIME,
     S_ISGID,
-    S_ISVTX
+    S_ISVTX,
+    XATTR_CREATE,
+    XATTR_REPLACE
 };
 use nix::sys::statvfs;
 use std::path::Path;
@@ -36,7 +41,7 @@ use crate::db_module::sqlite::Sqlite;
 use crate::sqerror::{Error, ErrorKind};
 use time::Timespec;
 use std::time::SystemTime;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 const ONE_SEC: Timespec = Timespec{
     sec: 1,
@@ -79,9 +84,9 @@ impl OpenDirHandler {
 
 pub struct SqliteFs{
     db: Sqlite,
-    lookup_count: Mutex<HashMap<u32, u32>>,
-    open_file_handler: Mutex<HashMap<u32, OpenFileHandler>>,
-    open_dir_handler: Mutex<HashMap<u32, OpenDirHandler>>,
+    lookup_count: Arc<Mutex<HashMap<u32, u32>>>,
+    open_file_handler: Arc<Mutex<HashMap<u32, OpenFileHandler>>>,
+    open_dir_handler: Arc<Mutex<HashMap<u32, OpenDirHandler>>>,
 }
 
 impl SqliteFs {
@@ -91,16 +96,16 @@ impl SqliteFs {
             Err(err) => return Err(err)
         };
         db.init()?;
-        let lookup_count = Mutex::new(HashMap::<u32, u32>::new());
-        let open_file_handler = Mutex::new(HashMap::<u32, OpenFileHandler>::new());
-        let open_dir_handler = Mutex::new(HashMap::<u32, OpenDirHandler>::new());
+        let lookup_count = Arc::new(Mutex::new(HashMap::<u32, u32>::new()));
+        let open_file_handler = Arc::new(Mutex::new(HashMap::<u32, OpenFileHandler>::new()));
+        let open_dir_handler = Arc::new(Mutex::new(HashMap::<u32, OpenDirHandler>::new()));
         Ok(SqliteFs{db, lookup_count, open_file_handler, open_dir_handler})
     }
 
     pub fn new_with_db(db: Sqlite) -> Result<SqliteFs, Error> {
-        let lookup_count = Mutex::new(HashMap::<u32, u32>::new());
-        let open_file_handler = Mutex::new(HashMap::<u32, OpenFileHandler>::new());
-        let open_dir_handler = Mutex::new(HashMap::<u32, OpenDirHandler>::new());
+        let lookup_count = Arc::new(Mutex::new(HashMap::<u32, u32>::new()));
+        let open_file_handler = Arc::new(Mutex::new(HashMap::<u32, OpenFileHandler>::new()));
+        let open_dir_handler = Arc::new(Mutex::new(HashMap::<u32, OpenDirHandler>::new()));
         Ok(SqliteFs{db, lookup_count, open_file_handler, open_dir_handler})
     }
 }
@@ -588,6 +593,86 @@ impl Filesystem for SqliteFs {
             stat.fragment_size() as u32
         );
         debug!("statfs {:?}", stat);
+    }
+
+    fn setxattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, value: &[u8], flags: u32, _position: u32, reply: ReplyEmpty) {
+        let ino = ino as u32;
+        let name = name.to_str().unwrap();
+        if flags & XATTR_CREATE as u32 > 0 || flags & XATTR_REPLACE as u32 > 0 {
+            match self.db.get_xattr(ino, name) {
+                Ok(_) => {
+                    if flags & XATTR_CREATE as u32 > 0 {
+                        reply.error(EEXIST);
+                        return;
+                    }
+                },
+                Err(err) => {
+                    match err.kind() {
+                        ErrorKind::FsNoEnt {description: _} => {
+                            if flags & XATTR_REPLACE as u32 > 0 {
+                                reply.error(ENODATA);
+                                return;
+                            }
+                        },
+                        _ => {
+                            reply.error(ENOENT);
+                            return;
+                        }
+                    }
+                }
+            };
+        }
+        match self.db.set_xattr(ino, name, value) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+        reply.ok();
+    }
+
+    fn getxattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
+        let ino = ino as u32;
+        let name = name.to_str().unwrap();
+        let value = match self.db.get_xattr(ino, name) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+        if size == 0 {
+            reply.size(value.len() as u32);
+        } else if size < value.len() as u32 {
+            reply.error(ERANGE);
+        } else {
+            reply.data(value.as_slice());
+        }
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        let ino = ino as u32;
+        let names =  match self.db.list_xattr(ino) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+        let mut data: Vec<u8> = Vec::new();
+        for v in names {
+            data.extend(v.bytes());
+            data.push(0);
+        }
+        if size == 0 {
+            reply.size(data.len() as u32);
+        } else if size < data.len() as u32 {
+            reply.error(ERANGE);
+        } else {
+            reply.data(data.as_slice());
+        }
+    }
+
+    fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+        let ino = ino as u32;
+        let name = name.to_str().unwrap();
+        match self.db.delete_xattr(ino, name) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+        };
+        reply.ok();
     }
 
     fn create(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, _flags: u32, reply: ReplyCreate) {

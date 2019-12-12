@@ -47,6 +47,14 @@ pub trait DbModule {
     fn delete_all_noref_inode(&mut self) -> Result<()>;
     /// Get block size of the filesystem
     fn get_db_block_size(&self) -> u32;
+    /// Set xattr value.
+    fn set_xattr(&mut self, inode: u32, key: &str, value: &[u8]) -> Result<()>;
+    /// Get xattr value.
+    fn get_xattr(&self, inode: u32, key: &str) -> Result<Vec<u8>>;
+    /// List xattr name.
+    fn list_xattr(&self, inode: u32) -> Result<Vec<String>>;
+    /// Delete xattr
+    fn delete_xattr(&mut self, inode: u32, key: &str) -> Result<()>;
 }
 
 // Imported from rust-fuse 4.0-dev

@@ -1,7 +1,7 @@
 # 概要
 
 ## 1行で
-この記事は、RustによるFUSEインターフェースの実装である `rust-fuse` を用いてFUSEを使ったファイルシステムの実装に挑戦し、
+この記事は、RustによるFUSEインターフェースの実装である `fuse-rs` を用いてFUSEを使ったファイルシステムの実装に挑戦し、
 得られた知見などを記録したものです。
 
 ## 概要
@@ -12,19 +12,20 @@ Filesystem in Userspace(FUSE) はLinuxのユーザ空間でファイルシステ
 また、HDDなどの実デバイスに直接読み書きするだけでなく、ネットワークストレージを利用した仮想的なファイルシステムを作るのにも都合がよいです。
 
 そんな訳で、FUSEを使ったSSH as a filesystem や AWS S3 as a filesystemといった
-「読み書きできる何かをファイルシステムとしてマウント出来るようにするソフトウェア」があれこれと存在します。
+「読み書きできる何かをファイルシステムとしてマウント出来るようにするソフトウェア」があれこれと存在します。  
+上記のようなソフトウェアの代表例である `sshfs` や `s3fs` は使った事のある人もいるのではないでしょうか。
 
-元々はLinuxの一部でしたが、MacOSやBSD系OSでも使用できます。最近ではWSL2でも使えるようになるようです。導入の手間が要るとはいえ、WindowsでもFUSEが使えるのは嬉しいですね。  
-ちなみにWindowsで動く仮想ファイルシステムである [Dokan](https://github.com/dokan-dev/dokany) もあります。
+元々はLinuxの一部でしたが、MacOSやFreeBSDでも使用できます。最近ではWindowsのWSL2でも使えるようになるようです。WSLの導入の手間が要るとはいえ、WindowsでもFUSEが使えるのは嬉しいですね。  
+ちなみにWindowsには、Fuseに似た仮想ファイルシステムである [Dokan](https://github.com/dokan-dev/dokany) もあります。
 
 ただし、カーネルモジュールを作るより楽とはいえ、FUSEを使ったソフトウェアを作成するのは大変です。  
-ある程度ファイルシステムの知識は必要ですし、ドキュメントが少なく、
-チュートリアルを見てもほどほどの所で終わってしまい、「あとはsshfsの実装などを見てくれ！」とコードの海に投げ出されます。
+ある程度ファイルシステムの知識は必要ですし、何か調べようとしてもドキュメントが少なく、
+チュートリアルを見てもほどほどの所で終わってしまい、「あとはサンプルとsshfsの実装などを見てくれ！」とコードの海に投げ出されます。
 
 そこで、各所の情報をまとめつつ、自分で0からファイルシステムを実装して気をつける点などを見つけていきます。
 
 ## 参考資料
-[rust-fuse](https://github.com/zargony/rust-fuse) : Rust版Fuseプロジェクト  
+[Rust FUSE](https://github.com/zargony/fuse-rs) : Rust版Fuseインターフェースのプロジェクト  
 [libfuse](https://github.com/libfuse/libfuse) : C版のFuseインターフェースライブラリ  
 [osxfuse](https://github.com/osxfuse/fuse) : MacOS向けのFuseインターフェースライブラリ  
 [FUSEプロトコルの説明](https://john-millikin.com/the-fuse-protocol) : カーネルモジュール <-> Fuseライブラリ間のプロトコル  
@@ -33,17 +34,17 @@ Filesystem in Userspace(FUSE) はLinuxのユーザ空間でファイルシステ
 [fuse_common.h(libfuseのヘッダ)](https://github.com/libfuse/libfuse/blob/master/include/fuse_common.h)  
 [Linuxプログラミングインターフェース(書籍)](https://www.oreilly.co.jp/books/9784873115856/) : システムコールがどう動くべきかは大体ここを見て判断する  
 [libfuseのメーリングリストのアーカイブ](https://sourceforge.net/p/fuse/mailman/fuse-devel/)  
-[gcsf](https://github.com/harababurel/gcsf) : rust-fuseを使ったファイルシステム  
+[gcsf](https://github.com/harababurel/gcsf) : fuse-rsを使ったファイルシステムの例  
 
 ## 実験環境
 プログラムは全て次の環境で実験しています。
 
-Linux: 5.2.14
-ディストリビューション: Fedora 30
-Rust: 1.38.0
-rust-fuse: 0.3.1
+Linux: 5.3.11
+ディストリビューション: Fedora 31
+Rust: 1.39.0
+fuse-rs: 0.3.1
 
-## FUSEの仕組み(アバウト)
+## FUSEの仕組み(概要)
 
 FUSE本体はLinuxカーネルに付属するカーネルモジュールで、大抵のディストリビューションではデフォルトで有効になっています。
 
@@ -53,7 +54,8 @@ FUSEを使ったファイルシステムがマウントされたディレクト�
 システムコール <-> VFS <-> FUSE <-(FUSE ABI)-> FUSEインターフェース <-(FUSE API)-> 自作のファイルシステム <-> デバイスやネットワーク上のストレージ
 ```
 
-[Wikipediaの図](https://ja.wikipedia.org/wiki/Filesystem_in_Userspace) を見ると分かりやすいです。
+[Wikipediaの図](https://ja.wikipedia.org/wiki/Filesystem_in_Userspace) を見ると分かりやすいです。  
+本来であればVFSの先に各ファイルシステムのカーネルモジュールがあるのですが、FUSEは受け取った情報をユーザ空間に横流ししてくれます。
 
 ## FUSEインターフェース
 
@@ -61,7 +63,7 @@ FUSEはデバイス `/dev/fuse` を持ち、ここを通じてユーザ空間と
 前項の `FUSE <-> FUSEインターフェース` の部分です。
 
 規定のプロトコル(FUSE ABI)を用いて `/dev/fuse` に対してデータを渡したり受け取ったりするのがFUSEインターフェースです。  
-有名なライブラリとして、 [libfuse](https://github.com/libfuse/libfuse) があります。  
+有名なライブラリとして、C/C++用の [libfuse](https://github.com/libfuse/libfuse) があります。  
 このlibfuseが大変強力なので、大抵の言語でのFUSEインターフェースはlibfuseのラッパーになっています。
 
 libfuseを使うと、 `open`, `read`, `write` 等の関数を決められた仕様通りに作成して登録するだけで、ファイルシステムとして動作するようになっています。
@@ -80,26 +82,34 @@ int my_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_
 ファイルシステムを作成する場合、どちらの関数群を実装するか選択する必要があります。  
 `fuse.h` の方はおおよそシステムコールと1:1で対応しています。 `lowlevel` の方は `FUSE ABI` と1:1になるように作られています。
 
-## rust-fuse
-Rustには(ほぼ)独自のFUSEインターフェースの実装 `Rust FUSE(rust-fuse)` があります。ありがたいですね。  
+## fuse-rs
+Rustには(ほぼ)独自のFUSEインターフェースの実装 [Rust FUSE(fuse-rs)](https://github.com/zargony/fuse-rs) があります。ありがたいですね。  
 プロトコルが同じなので、インターフェースの関数(FUSE API)はlibfuseのlowlevel関数と大変似ています。
 そのため、何か困った時にはlibfuseの情報が流用できたりします。  
 
 現時点(2019/10) の最新版は0.3.1で、2年ぐらい更新されていませんが、次バージョン(0.4.0)が開発中です。  
-0.3.1と0.4.0では日時関係の型が大幅に違うので注意してください。  
+0.3.1と0.4.0では仕様が大きく異なるので注意してください。  
 また、0.3.1では対応するプロトコルのバージョンが7.8で、最新のものと比較していくつかの機能がありません。
 
-libfuseはマルチスレッドで動作し、並列I/Oに対応していますが、rust-fuseはシングルスレッドのようです。
+libfuseはマルチスレッドで動作し、並列I/Oに対応していますが、fuse-rsはシングルスレッドのようです。
+
+使用するためには、 `Cargo.toml` に以下のように記述します。
+
+```toml
+[dependencies]
+fuse = "0.3.1"
+```
 
 # データの保存先
 今回自分でファイルシステムを実装していく上で、HDDの代わりになるデータの保存先としてsqliteを使用します。  
-ライブラリは [rusqlite](https://github.com/jgallagher/rusqlite) を使用します。
+ライブラリは [rusqlite](https://github.com/jgallagher/rusqlite) を使用します。  
+FUSEの実装方法について調べるのがメインなので、こちらについてはざっくりとしか説明しませんが、ご容赦ください。
 
 sqliteは可変長のバイナリデータを持てるので、そこにデータを書き込みます。
 トランザクションがあるので、ある程度アトミックな操作ができます。
 DBなので、メタデータの読み書きも割と簡単にできるでしょう。
 
-rust-fuseが扱う整数の大半は `u64` ですが、sqliteはunsignedの64bit intに対応していないので、厳密にやろうとするといろいろと面倒になります。  
+fuse-rsが扱う整数の大半は `u64` ですが、sqliteはunsignedの64bit intに対応していないので、厳密にやろうとするといろいろと面倒になります。  
 とりあえず全部 `u32` にキャストする事にしますが、気になる場合は `i64` にキャストして、大小比較を行うユーザ定義関数をsqlite上に作成したり、
 `u32` 2個に分割したりしてください。
 
@@ -114,7 +124,7 @@ DBの構造についてざっくりと説明していきます。
 ### MDT
 ファイルのinode番号をキーとして検索するとメタデータが返ってくるような、メタデータ用のテーブルを作ります。  
 メタデータは一般的なファイルシステムのメタデータと同じような形式です。  
-rust-fuseが関数の引数で渡してきたり、戻り値として要求したりするメタデータ構造体は以下のように定義されています。
+fuse-rsが関数の引数で渡してきたり、戻り値として要求したりするメタデータ構造体は以下のように定義されています。
 
 ```rust
 // fuse::FileAttr
@@ -180,7 +190,7 @@ FUSEでは `stat(2)` と同様に、 `mode` にファイル種別のビットも
 ビット操作する必要があります。  
 cのlibfuseでは `libc::S_IFMT` (該当ビットのマスク) `libc::S_IFREG` (通常ファイルを示すビット) 等を用いて
 `if((mode & S_IFMT) == S_IFREG)` のようにして判別する事ができます。  
-rust-fuseの場合はメタデータを返す時はenumで定義されたファイル種別を使い、ビット操作はライブラリ側で処理してくれるので、
+fuse-rsの場合はメタデータを返す時はenumで定義されたファイル種別を使い、ビット操作はライブラリ側で処理してくれるので、
 実際のビットがどうなっているかを気にするケースはあまりありませんが、  
 `mknod` の引数で `mode` が生の値で渡ってくるので、 `mknod` を実装する場合は気をつける必要があります。
 
@@ -206,7 +216,7 @@ BDTはファイルのinode番号, 何番目のブロックか、の列を持ち�
 1. オブジェクトストレージのように、各ファイルがフルパスを記憶していて、文字列操作で各ディレクトリの情報を得る方法
 1. 一般的なファイルシステムのように、ディレクトリエントリを作る方法
 
-今回はrust-fuseの関数とも相性のいい後者のディレクトリエントリ方式で行います。  
+今回はfuse-rsの関数とも相性のいい後者のディレクトリエントリ方式で行います。  
 ディレクトリのinode番号を指定すると、ディレクトリ内の全てのエントリ(ファイル名、ファイルタイプ、inode番号のセット)を返すようなテーブルを作成します。
 
 必要なのは以下のデータです。
@@ -228,7 +238,7 @@ BDTはファイルのinode番号, 何番目のブロックか、の列を持ち�
 
 # Hello!
 ## 概要
-第一段階として、rust-fuseに付属する、サンプルプログラムの `HelloFS` と同じ機能を実装します。
+第一段階として、fuse-rsに付属する、サンプルプログラムの `HelloFS` と同じ機能を実装します。
 `HelloFS` は以下の機能があります。
 
 1. ファイルシステムはリードオンリー
@@ -238,22 +248,32 @@ BDTはファイルのinode番号, 何番目のブロックか、の列を持ち�
 `HelloFS` の機能を実現するのに必要なのは以下の4つの関数です。
 
 ```rust
-fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry){
-    ...
-}
-fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-    ...
-}
-fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, _size: u32, reply: ReplyData) {
-    ...
-}
-fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
-    ...
+use fuse::{
+    Filesystem,
+    ReplyEntry,
+    ReplyAttr,
+    ReplyData,
+    ReplyDirectory,
+    Request
+};
+impl Filesystem for SqliteFs {
+    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry){
+        ...
+    }
+    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        ...
+    }
+    fn read(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, _size: u32, reply: ReplyData) {
+        ...
+    }
+    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+        ...
+    }
 }
 ```
 
 ファイルやディレクトリをopen/closeする関数を実装せずにread関数やreaddir関数を実装していますが、
-`libfuse` や `rust-fuse` は全ての関数にデフォルトの実装があり、
+`libfuse` や `fuse-rs` は全ての関数にデフォルトの実装があり、
 今回のようにreadonlyで状態を持たないファイルシステムの場合、自分で実装しなくても動作します。  
 これらの関数については今後実装する必要が出てきた時に説明します。
 
@@ -312,7 +332,7 @@ pub struct DEntry {
 ## fuseの関数全般の話
 ### fuseの関数
 ファイルシステムなので、関数は基本的に受け身です。システムコールに応じて呼び出されます。  
-rust-fuseでは、 `Filesystem` トレイトが定義されているので、必要な関数を適宜実装していきます。
+fuse-rsでは、 `Filesystem` トレイトが定義されているので、必要な関数を適宜実装していきます。
 
 ### 引数
 どの関数にも `Request` 型の引数 `req` が存在します。  
@@ -423,14 +443,14 @@ EOFまたはエラーを返す場合を除いて、 `read` 関数は引数の `s
 この場合EOFなので、200byte返す事が許されます。また、200byte以上返しても切り捨てられます。  
 それ以外の場合で要求された長さのデータを用意できない場合は、エラーを返さないといけません。
 
-libfuseやrust-fuseの説明では、「もし短いサイズのデータを返した場合、0埋めされる」と書いてありますが、
+libfuseやfuse-rsの説明では、「もし要求されたサイズより短いサイズのデータを返した場合、0埋めされる」と書いてありますが、
 手元の環境では0埋めされず、短いサイズが `read(2)` の結果として返ってきました。  
 [カーネルのこのコミット](https://github.com/torvalds/linux/commit/5c5c5e51b26413d50a9efae2ca7d6c5c6cd453ac#diff-a00aec43f56686c876d5fec8bb227e10)
 で仕様が変わっているように見えます。
 
-例外として、 `direct_io` をマウントオプションとして指定していた場合、 `direct_io` フラグを `open` の戻り値として指定した場合、
+例外として、 `direct_io` をマウントオプションとして指定していた場合、または `direct_io` フラグを `open` の戻り値として指定した場合、
 カーネルは `read(2)` システムコールの戻り値としてファイルシステムの戻り値を直接使うので、ファイルシステムは実際に読み込んだ長さを返します。  
-諸事情(ストリーミングしてる等)でファイルサイズと実際のデータの長さが異なる場合に、このオプションが利用できます。
+諸事情(ストリーミングしてる等の理由)でファイルサイズと実際のデータの長さが異なる場合に、このオプションが利用できます。
 
 引数の `fh` は `open` 時に戻り値としてファイルシステムが指定した値です。同じファイルに対して複数の `open` が来たときに、
 どの `open` に対しての `read` かを識別したり、ファイルオープン毎に状態を持つことができます。  
@@ -519,7 +539,7 @@ fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply
 ## マウント
 main関数で `fuse::mount()` を実行すると、マウントできます。
 
-rust-fuseは [env_logger](https://github.com/sebasmagri/env_logger/) に対応しているので、最初に有効にしておきます。  
+fuse-rsは [env_logger](https://github.com/sebasmagri/env_logger/) に対応しているので、最初に有効にしておきます。  
 `RUST_LOG=debug [コマンド]` のように、環境変数でレベルを設定できます。  
 `DEBUG` レベルにすると各関数の呼び出しを記録してくれます。
 
@@ -550,7 +570,7 @@ fn main() {
 ```
 
 ## 初期データ登録
-自動でテーブルを作成する機能をまだ実装していないので、初期化用の `init.sql` と、hello.txt追加用の `hello.sql` 
+自動でテーブルを作成する機能をまだ実装していません。初期化用の `init.sql` と、hello.txt追加用の `hello.sql` 
 がソースコードに付属しているので、実行してデータベースを作成します。
 
 ```text
@@ -584,6 +604,9 @@ Hello World!
 [2019-10-25T10:43:42Z DEBUG fuse::request] FLUSH(10) ino 0x0000000000000002, fh 0, lock owner 12734418937618606797
 [2019-10-25T10:43:42Z DEBUG fuse::request] RELEASE(12) ino 0x0000000000000002, fh 0, flags 0x8000, release flags 0x0, lock owner 0
 ```
+
+lookup -> open -> read -> close の順で関数が呼び出されている事が分かります。  
+`close` に対応する関数である `flush` と `release` は実装していませんが、動作しています。
 
 ファイルシステムは `fusermount -u [マウント先]` でアンマウントできます。アンマウントするとプログラムは終了します。  
 `Ctrl + c` 等でプログラムを終了した場合でもマウントしたままになっているので、かならず `fusermount` を実行してください。
@@ -631,7 +654,7 @@ fn write(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, data: &[
 引数の `inode` で指定されたファイルに、引数の `data` で渡ってきたデータを書き込みます。
 
 `write(2)` のようなシステムコールを使う場合はファイルオフセットを意識する必要がありますが、
-カーネルがオフセットの管理をしてくれているので、 `pwrite(2)` 相当の関数を一つ実装するだけで済むようになっています。
+FUSEではカーネルがオフセットの管理をしてくれているので、 `pwrite(2)` 相当の関数を一つ実装するだけで済むようになっています。
 
 マウントオプションに `direct_io` が設定されていない場合、エラーを返す場合を除いて、writeはsizeで指定された数字をreplyで返さないといけません。  
 指定されている場合は、実際に書き込んだバイト数を返します。
@@ -654,7 +677,7 @@ fn write(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, data: &[
 
 (今のところ)カーネルは `offset` をきちんと設定してくれるようです。  
 なので、現状は `O_APPEND` は無視し、 `open` 実装時に対応します。  
-ただし、ネットワークファイルシステムなどで複数のマシンから `O_APPEND` で書き込みがあった場合、カーネルの認知しているファイル末尾と
+ただし、ネットワーク上のストレージを利用しているファイルシステムなどで複数のマシンから `O_APPEND` で書き込みがあった場合、カーネルの認知しているファイル末尾と
 実際のファイル末尾がずれるので、問題が発生します。  
 こういった問題が発生しうるファイルシステムを作る場合は、対処する必要があります。
 
@@ -791,15 +814,15 @@ fn setattr(&mut self, _req: &Request<'_>, ino: u64, mode: Option<u32>, uid: Opti
 `write` は実装しましたが、このままでは追記しかできません。  
 ファイルを丸ごと更新するために、ファイルサイズを0にする(truncateに相当) 処理を実装します。
 
-rust-fuseでは、 `setattr` を実装する事でファイルサイズの変更が可能になります。  
+fuse-rsでは、 `setattr` を実装する事でファイルサイズの変更が可能になります。  
 ついでに `setattr` で変更できる全てのメタデータを変更できるようにします。
 
-`truncate(2)` でファイルサイズを変更する時、 `open(2)` で `O_TRUNC` を指定した時も、この関数が呼ばれます。
+`truncate(2)` でファイルサイズを変更する時と、 `open(2)` で `O_TRUNC` を指定した時も、この関数が呼ばれます。
 
-`setattr` は引数に `Option` で値が指定されるので、中身がある場合はその値で更新していきます。  
+`setattr` は各引数に `Option` 型で値が指定されるので、中身がある場合はその値で更新していきます。  
 `reply` に入れる値は、更新後のメタデータです。
 
-なお、 `ctime` は 現在のrust-fuseがプロトコルのバージョンの問題で未対応なので、引数には入っていません。  
+なお、 `ctime` は 現在のfuse-rsがプロトコルのバージョンの問題で未対応なので、引数には入っていません。  
 基本的に `ctime` は自由に設定する事ができず、 `setattr` を実行すると現在時刻になるはずなので、問題はありません。
 
 `open` 時に `O_TRUNC` を指定した場合のように、ファイルサイズに0が指定された場合は既存のデータを全て破棄すればいいですが、
@@ -907,14 +930,20 @@ fn create(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, _mode: u32
 ファイルを作成する関数は `create` 、削除する関数は `unlink` ですが、 `lookup count` の都合で追加でいろいろ実装する必要があります。
 
 ## lookup count
+ファイル削除に絡む関数を実装する場合、 `lookup count` に注意する必要があります。
+
+以下では lookup count と参照カウントという2種類の言葉を使っていますが、  
+大まかに説明すると、lookup count はいくつのプロセスがファイルを開いているか(または開く予定か)、  
+参照カウントはファイルがいくつハードリンクされているか、を示しています。
+
 `lib.rs` や `fuse_lowlevel.h` によると、
 「lookup count が0でない内は、unlink, rmdir, rename(で上書き)されて参照カウントが0になってもinodeを削除しないでね」という事です。  
 lookup countは最初は0で、ReplyEntryとReplyCreateがある全ての関数が呼ばれるたびに、1ずつ増やしていきます。  
-具体的には、 `lookup`, `mknod`, `mkdir`, `symlink`, `link`, `create` です。
+具体的には、 `lookup`, `mknod`, `mkdir`, `symlink`, `link`, `create` が実行されると1増えます。
 
-`forget` はlookup countを減らす関数です。 `forget` でlookup countが0になるまでは、削除を遅らせます。  
-カーネルは、まだファイルをOpenしているプロセスがあると、 `forget` をファイルが閉じられるまで遅延させます。  
-これにより、「別の誰かがファイルを削除したが、削除前からファイルを開いていた場合は読み込み続ける事ができる」というアレが実現できます。
+`forget` はlookup countを減らす関数です。 `forget` でlookup countが0になるまでは、ファイルシステムは削除を遅らせる必要があります。  
+例えば、カーネルはまだファイルをOpenしているプロセスがあると、 `forget` をファイルが閉じられるまで遅延させます。  
+これにより、「別の誰かがファイルを削除して `ls` 等でファイルを見つけられなくなるが、削除前からファイルを開いていた場合は読み込み続ける事ができる」というアレが実現できます。
 
 lookup countを実装するために、ファイルシステムの構造体に次の変数を追加します。
 
@@ -933,13 +962,13 @@ keyがinode番号、valueがlookup count、であるHashMapを作成します。
 今回は以下のようなDB関数を追加しました。
 
 ```rust
-/// inodeを追加する
+/// ファイル/ディレクトリのinodeを追加し、新しく割り振ったinode番号を返す。 引数attrのinoは無視される。
 fn add_inode(&mut self, parent: u32, name: &str, attr: &DBFileAttr) -> Result<u32, Error>;
 /// inodeをチェックし、参照カウントが0なら削除する
 fn delete_inode_if_noref(&mut self, inode: u32) -> Result<(), Error>;
 /// 親ディレクトリのinode番号、ファイル/ディレクトリ名で指定されたディレクトリエントリを削除し、
 /// 該当のinodeの参照カウントを1減らす
-/// inode番号を返す
+/// 削除したファイル/ディレクトリのinode番号を返す
 fn delete_dentry(&mut self, parent: u32, name: &str) -> Result<u32, Error>;
 /// 参照カウントが0である全てのinodeを削除する
 fn delete_all_noref_inode(&mut self) -> Result<(), Error>;
@@ -982,7 +1011,7 @@ fn create(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, f
 
 引数の `parent` のinode番号で指定されたディレクトリ内の、 `name` で指定されたファイル名を持つファイルを作成します。
 
-`creat(2)`または `O_CREAT` を指定した `open(2)` 実行時に呼ばれます。
+`creat(2)` または `O_CREAT` を指定した `open(2)` 実行時に呼ばれます。
 
 指定されたファイルが存在しない場合、引数の `mode` で指定されたモードでファイルを作成し、ファイルを開きます。  
 ファイルのオーナーに設定するユーザ、グループは、引数の `req` から `req.uid()` `req.gid()` で取得できます。  
@@ -993,13 +1022,13 @@ fn create(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, mode: u32, f
 
 ファイルを作成する以外は `open` と同じ動作のため、open時のフラグが `flags` で渡されます。
 
-フラグで `O_EXCL` が指定されている場合、指定した名前のファイルが存在するとエラーにしなければなりませんが、
+`creat(2)` や `open(2)` ではフラグに `O_EXCL` が指定されている場合、指定した名前のファイルが既に存在するとエラーにしなければなりませんが、
 この処理はカーネルがやってくれているようです。
 
 `create` が実装されていない場合、カーネルは `mknod` と `open` を実行します。
 
 なお、`create` が実装されている場合、libfuseは通常ファイルの `mknod` が実行されると `create` を呼び出しますが、
-rust-fuseは呼び出してくれません。
+fuse-rsは呼び出してくれません。
 
 実装したコードは以下のようになります。
 
@@ -1025,7 +1054,7 @@ fn create(
         // ファイル作成
         let now = SystemTime::now();
         attr = DBFileAttr {
-            ino: 0,
+            ino: 0, // 無視されるので0にする
             size: 0,
             blocks: 0,
             atime: now,
@@ -1066,12 +1095,12 @@ fn create(
 fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty);
 ```
 
-親ディレクトリのinode番号が引数の `parent`, ファイル/ディレクトリ名が `name` で指定されるので、
+親ディレクトリのinode番号が引数の `parent`, 削除対象のファイル/ディレクトリの名前が `name` で指定されるので、
 ファイルまたはディレクトリを削除します。
 
 削除対象はディレクトリエントリと、該当のinodeのメタデータです。
 ただし、inodeはハードリンクされて複数のディレクトリエントリから参照されている可能性があるので、参照カウント( `nlink` ) を1減らし、0になった場合に削除します。  
-また、 lookup count をチェックし、0になっていない場合は削除を行いません。
+また、 lookup count をチェックし、0になっていない場合は即座に削除を行いません。
 
 ```rust
 fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -1083,7 +1112,7 @@ fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: Reply
     // lookup countのチェック
     let lc_list = self.lookup_count.lock().unwrap();
     if !lc_list.contains_key(&ino) {
-        // 参照カウントが0の場合削除する
+        // 参照カウントが0の場合削除する。そうでない場合、unlink 内では削除しない
         match self.db.delete_inode_if_noref(ino) {
             Ok(n) => n,
             Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
@@ -1444,7 +1473,7 @@ cの `fuse_lowlevel` の説明によると、変更先にファイルまたは�
 
 この辺りはカーネルが処理してくれているようで、 `rename` 関数が呼ばれずにエラーになります。
 
-libfuseでは上書き禁止を指定したりできる `flag` が引数に指定されますが、rust-fuseには該当する引数がありません。
+libfuseでは上書き禁止を指定したりできる `flag` が引数に指定されますが、fuse-rsには該当する引数がありません。
 
 ```rust
 fn rename(
@@ -1950,8 +1979,8 @@ frsize: u32; //最小のブロックのバイト数 (ex: 512, 1024, 2048, 4096)
 
 # 拡張ファイル属性
 ## 概要
-拡張ファイル属性は、ユーザがkey-valueペアのメタデータをファイルやディレクトリに付ける事が出来る機能です。  
-主にACLやselinuxが利用しています。
+拡張ファイル属性は、ユーザがkey-valueペアのメタデータを自由にファイルやディレクトリに付ける事が出来る機能です。  
+Linuxでは主にACLやselinuxが利用しています。
 
 拡張ファイル属性の操作に必要な関数は以下の4つです。
 
@@ -1967,6 +1996,155 @@ fn listxattr(&mut self, _req: &Request<'_>, _ino: u64, _size: u32, reply: ReplyX
 }
 fn removexattr(&mut self, _req: &Request<'_>, _ino: u64, _name: &OsStr, reply: ReplyEmpty) {
     ...
+}
+```
+
+## setxattr
+```rust
+fn setxattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, value: &[u8], flags: u32, position: u32, reply: ReplyEmpty);
+```
+拡張ファイル属性を設定します。
+引数は `setxattr(2)` と同様です。
+
+実装しない( `ENOSYS` を返す) 場合、拡張ファイル属性をサポートしない( `ENOTSUP` と同様)と解釈され、
+以降はカーネルからファイルシステムの呼び出しを行わずに失敗するようになります。
+
+拡張属性は `name: value` の形式で与えられます。 
+
+引数の `position` はmacのリソースフォークで使用されている値で、
+基本は0です。osxfuseにのみ存在する引数です。(現在のrustの実装では、mac以外は0を返す)  
+fuse-rsでは、 `getxattr` の方に [実装されていないまま](https://github.com/zargony/fuse-rs/issues/40) なので、
+とりあえず放置でよいと思われます。
+
+引数の `flags` には `XATTR_CREATE` または `XATTR_REPLACE` が指定されます。  
+`XATTR_CREATE` が指定された場合、既に属性が存在する場合は `EEXIST` を返して失敗します。  
+`XATTR_REPLACE` が指定された場合、属性が存在しない場合 `ENODATA` を返して失敗します。  
+デフォルトでは、属性が存在しない場合は拡張ファイル属性を作成し、既に存在する場合は値を置き換えます。
+
+実装は以下のようになります。
+
+```rust
+fn setxattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, value: &[u8], flags: u32, _position: u32, reply: ReplyEmpty) {
+    let ino = ino as u32;
+    let name = name.to_str().unwrap();
+    // フラグチェック
+    if flags & XATTR_CREATE as u32 > 0 || flags & XATTR_REPLACE as u32 > 0 {
+        match self.db.get_xattr(ino, name) {
+            Ok(_) => {
+                if flags & XATTR_CREATE as u32 > 0 {
+                    reply.error(EEXIST);
+                    return;
+                }
+            },
+            Err(err) => {
+                match err.kind() {
+                    ErrorKind::FsNoEnt {description: _} => {
+                        if flags & XATTR_REPLACE as u32 > 0 {
+                            reply.error(ENODATA);
+                            return;
+                        }
+                    },
+                    _ => {
+                        reply.error(ENOENT);
+                        return;
+                    }
+                }
+            }
+        };
+    }
+    match self.db.set_xattr(ino, name, value) {
+        Ok(n) => n,
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+    reply.ok();
+}
+```
+
+## getxattr
+```rust
+fn getxattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr);
+```
+
+引数の`ino` で指定されたinode番号のファイルの、 `name` で指定された拡張ファイル属性の値を取得します。
+
+引数の `size` が0の場合、値のデータのバイト数を `reply.size()` に入れます。
+
+`size` が0でない場合、以下のような処理になります。  
+値のデータのバイト数が `size` 以下の場合、 `reply.data()` に値を入れて返します。  
+`size` を超える場合、 `reply.error(ERANGE)` を返します。
+
+```rust
+fn getxattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, size: u32, reply: ReplyXattr) {
+    let ino = ino as u32;
+    let name = name.to_str().unwrap();
+    let value = match self.db.get_xattr(ino, name) {
+        Ok(n) => n,
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+    if size == 0 {
+        reply.size(value.len() as u32);
+    } else if size < value.len() as u32 {
+        reply.error(ERANGE);
+    } else {
+        reply.data(value.as_slice());
+    }
+}
+```
+
+## listxattr
+```rust
+fn listxattr(&mut self, _req: &Request<'_>, _ino: u64, _size: u32, reply: ReplyXattr);
+```
+
+引数の `ino` で指定されたinode番号のファイルにセットされている拡張ファイル属性の名前一覧を返します。
+
+返すべきデータは、「ヌル終端された文字列が連続して並んでいる」フォーマットになります。  
+例えば、 `user.xxx.data` と `user.yyy.name` という名前の拡張ファイル属性がある場合、データは以下のようになります。  
+ex: `user.xxx.data\0user.yyy.name\0`
+
+引数の `size` が0の場合、連結した文字列のサイズ(末尾の `\0` も含める)を `reply.size()` に入れます。
+
+0でない場合、データのサイズが `size` 以下の場合、 `reply.data()` にデータを入れて返します。  
+`size` を超える場合、 `reply.error(ERANGE)` を返します。
+
+```rust
+fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+    let ino = ino as u32;
+    let names =  match self.db.list_xattr(ino) {
+        Ok(n) => n,
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+    let mut data: Vec<u8> = Vec::new();
+    for v in names {
+        data.extend(v.bytes());
+        data.push(0);
+    }
+    if size == 0 {
+        reply.size(data.len() as u32);
+    } else if size < data.len() as u32 {
+        reply.error(ERANGE);
+    } else {
+        reply.data(data.as_slice());
+    }
+}
+```
+
+## removexattr
+```rust
+fn removexattr(&mut self, _req: &Request<'_>, _ino: u64, _name: &OsStr, reply: ReplyEmpty);
+```
+
+引数の`ino` で指定されたinode番号のファイルの、 `name` で指定された拡張ファイル属性を削除します。
+
+```rust
+fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
+    let ino = ino as u32;
+    let name = name.to_str().unwrap();
+    match self.db.delete_xattr(ino, name) {
+        Ok(n) => n,
+        Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+    };
+    reply.ok();
 }
 ```
 
