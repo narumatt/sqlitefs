@@ -43,3 +43,14 @@ $ cat ~/mount/hello.txt
 Hello world!
 ```
 
+## functions
+
+- [x] Create/Read/Delete directories
+- [x] Create/Read/Write/Delete files
+- [x] Change attributions
+- [x] Copy/Move files
+- [x] Create Hard Link and Symbolic Link
+- [x] Read/Write extended attributes
+- [] File lock operations
+- [] Strict error handling
+

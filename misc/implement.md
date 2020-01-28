@@ -2,7 +2,8 @@
 
 ## 1行で
 この記事は、RustによるFUSEインターフェースの実装である `fuse-rs` を用いてFUSEを使ったファイルシステムの実装に挑戦し、
-得られた知見などを記録したものです。
+得られた知見などを記録したものです。作成したファイルシステムは [こちら](https://github.com/narumatt/sqlitefs)
+に置いてあります。
 
 ## 概要
 
@@ -27,22 +28,22 @@ Filesystem in Userspace(FUSE) はLinuxのユーザ空間でファイルシステ
 ## 参考資料
 [Rust FUSE](https://github.com/zargony/fuse-rs) : Rust版Fuseインターフェースのプロジェクト  
 [libfuse](https://github.com/libfuse/libfuse) : C版のFuseインターフェースライブラリ  
-[osxfuse](https://github.com/osxfuse/fuse) : MacOS向けのFuseインターフェースライブラリ  
+[osxfuse](https://github.com/osxfuse/fuse) : MacOS向けのFuseモジュール  
 [FUSEプロトコルの説明](https://john-millikin.com/the-fuse-protocol) : カーネルモジュール <-> Fuseライブラリ間のプロトコル  
 [VFSの説明](https://ja.osdn.net/projects/linuxjf/wiki/vfs.txt)  
 [fuse_lowlevel.h(libfuseのヘッダ)](https://github.com/libfuse/libfuse/blob/master/include/fuse_lowlevel.h): lowlevel関数の説明  
 [fuse_common.h(libfuseのヘッダ)](https://github.com/libfuse/libfuse/blob/master/include/fuse_common.h)  
 [Linuxプログラミングインターフェース(書籍)](https://www.oreilly.co.jp/books/9784873115856/) : システムコールがどう動くべきかは大体ここを見て判断する  
-[libfuseのメーリングリストのアーカイブ](https://sourceforge.net/p/fuse/mailman/fuse-devel/)  
+[libfuseのメーリングリストのアーカイブ](https://sourceforge.net/p/fuse/mailman/fuse-devel/) : fuseの使い方についてはここが一番参考になる  
 [gcsf](https://github.com/harababurel/gcsf) : fuse-rsを使ったファイルシステムの例  
 
 ## 実験環境
 プログラムは全て次の環境で実験しています。
 
-Linux: 5.3.11
-ディストリビューション: Fedora 31
-Rust: 1.39.0
-fuse-rs: 0.3.1
+- Linux: 5.3.11
+- ディストリビューション: Fedora 31
+- Rust: 1.39.0
+- fuse-rs: 0.3.1
 
 ## FUSEの仕組み(概要)
 
@@ -121,7 +122,7 @@ DBの構造についてざっくりと説明していきます。
 
 以下では各テーブルについて説明していきます。
 
-### MDT
+### メタデータ用テーブル(MDT)
 ファイルのinode番号をキーとして検索するとメタデータが返ってくるような、メタデータ用のテーブルを作ります。  
 メタデータは一般的なファイルシステムのメタデータと同じような形式です。  
 fuse-rsが関数の引数で渡してきたり、戻り値として要求したりするメタデータ構造体は以下のように定義されています。
@@ -194,7 +195,7 @@ fuse-rsの場合はメタデータを返す時はenumで定義されたファイ
 実際のビットがどうなっているかを気にするケースはあまりありませんが、  
 `mknod` の引数で `mode` が生の値で渡ってくるので、 `mknod` を実装する場合は気をつける必要があります。
 
-### BDT
+### ファイルデータ用テーブル(BDT)
 ファイルのinode番号とファイル内のブロック番号を指定するとデータが返ってくるような、ブロックデータテーブルを作成します。  
 ブロックデータテーブル(BDT)のblobにデータを格納します。
 BDTはファイルのinode番号, 何番目のブロックか、の列を持ちます。具体的には以下のようになります。
@@ -210,7 +211,7 @@ BDTはファイルのinode番号, 何番目のブロックか、の列を持ち�
 
 「あるファイルのあるブロック」は一意なので、主キーとして `(file_id, block_num)` を指定します。
 
-### DET
+### ディレクトリ構造用テーブル(DET)
 ディレクトリ構造を表現する方法は、以下の2つの候補があります。
 
 1. オブジェクトストレージのように、各ファイルがフルパスを記憶していて、文字列操作で各ディレクトリの情報を得る方法
@@ -570,8 +571,9 @@ fn main() {
 ```
 
 ## 初期データ登録
-自動でテーブルを作成する機能をまだ実装していません。初期化用の `init.sql` と、hello.txt追加用の `hello.sql` 
-がソースコードに付属しているので、実行してデータベースを作成します。
+自動でテーブルを作成する機能をまだ実装していません。初期化用の [init.sql](https://github.com/narumatt/sqlitefs/blob/hello/init.sql) と、
+hello.txt追加用の [hello.sql](https://github.com/narumatt/sqlitefs/blob/hello/hello.sql)` 
+を作成して、実行してデータベースを作成します。
 
 ```text
 $ sqlite3 ~/filesystem.sqlite < init.sql
@@ -608,12 +610,16 @@ Hello World!
 lookup -> open -> read -> close の順で関数が呼び出されている事が分かります。  
 `close` に対応する関数である `flush` と `release` は実装していませんが、動作しています。
 
+## ファイルシステムのアンマウント
 ファイルシステムは `fusermount -u [マウント先]` でアンマウントできます。アンマウントするとプログラムは終了します。  
 `Ctrl + c` 等でプログラムを終了した場合でもマウントしたままになっているので、かならず `fusermount` を実行してください。
 
 ## まとめ
 4つの関数を実装するだけで、Readonlyのファイルシステムが作成できました。  
 次回はファイルにデータの書き込みができるようにします。
+
+ここまでのコードは [github](https://github.com/narumatt/sqlitefs/tree/hello) に置いてあります。
+
 
 # ReadWrite
 ## 概要

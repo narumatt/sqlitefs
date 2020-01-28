@@ -9,7 +9,7 @@
 1. link, symlink
 1. additional functions and errors
 1. permissions
-1. rock operation
+1. lock operation
 1. extended attributes
 
 ## 未実装リスト
