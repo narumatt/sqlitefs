@@ -1906,6 +1906,8 @@ fn opendir(&mut self, _req: &Request<'_>, ino: u64, flags: u32, reply: ReplyOpen
 open中に追加または削除されたエントリは返しても返さなくても良いですが、追加または削除されていないエントリは必ず返さないといけないので、
 厳密に対応しようとするなら、ディレクトリエントリをコピーして、情報を保持しておくとよいです。
 
+ただし、MacOSでは一度opendirするとしばらく開いたままなので、readdirを実行するたびに最新の情報を返すようにします。
+
 引数の `flags` は `open(2)` で `O_DIRECTORY` を選択した時に `opendir` が呼ばれるので、その引数です。  
 手元の環境で `opendir(3)` を実行すると、 `O_NONBLOCK`, `O_DIRECTORY`, `O_LARGEFILE` が呼ばれました。
 

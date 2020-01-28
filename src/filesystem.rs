@@ -27,12 +27,18 @@ use libc::{
     ERANGE,
     O_RDONLY,
     O_APPEND,
-    O_NOATIME,
     S_ISGID,
     S_ISVTX,
     XATTR_CREATE,
     XATTR_REPLACE
 };
+
+#[cfg(not(target_os = "macos"))]
+use libc::O_NOATIME;
+
+#[cfg(target_os = "macos")]
+const O_NOATIME: u32=0;
+
 use nix::sys::statvfs;
 use std::path::Path;
 use std::ffi::OsStr;
@@ -544,6 +550,7 @@ impl Filesystem for SqliteFs {
         reply.opened(fh, 0);
     }
 
+    #[cfg(not(target_os = "macos"))]
     fn readdir(&mut self, _req: &Request, ino: u64, fh: u64, offset: i64, mut reply: ReplyDirectory) {
         /*let db_entries = match self.db.get_dentry(ino as u32) {
             Ok(n) => n,
@@ -557,6 +564,24 @@ impl Filesystem for SqliteFs {
         } {
             Some(n) => n,
             None => {reply.error(ENOENT); return;}
+        };
+
+        for (i, entry) in db_entries.iter().enumerate().skip(offset as usize) {
+            let full = reply.add(entry.child_ino as u64, (i + 1) as i64, entry.file_type, &entry.filename);
+            if full {
+                break;
+            }
+            debug!("filesystem:readdir, ino: {:?} offset: {:?} kind: {:?} name: {}", entry.child_ino as u64, (i + 1) as i64, entry.file_type, entry.filename);
+        }
+        reply.ok();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn readdir(&mut self, _req: &Request, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+        let ino = ino as u32;
+        let db_entries = match self.db.get_dentry(ino) {
+            Ok(n) => n,
+            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
         };
 
         for (i, entry) in db_entries.iter().enumerate().skip(offset as usize) {
@@ -583,11 +608,11 @@ impl Filesystem for SqliteFs {
     fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
         let stat = statvfs::statvfs("/").unwrap();
         reply.statfs(
-            stat.blocks(),
-            stat.blocks_free(),
-            stat.blocks_available(),
-            stat.files(),
-            stat.files_free(),
+            stat.blocks() as u64,
+            stat.blocks_free() as u64,
+            stat.blocks_available() as u64,
+            stat.files() as u64,
+            stat.files_free() as u64,
             stat.block_size() as u32,
             stat.name_max() as u32,
             stat.fragment_size() as u32
