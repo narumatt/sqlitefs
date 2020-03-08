@@ -659,7 +659,7 @@ impl Filesystem for SqliteFs {
         let name = name.to_str().unwrap();
         let value = match self.db.get_xattr(ino, name) {
             Ok(n) => n,
-            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+            Err(err) => {reply.error(ENODATA); debug!("{}", err); return;}
         };
         if size == 0 {
             reply.size(value.len() as u32);
@@ -674,7 +674,7 @@ impl Filesystem for SqliteFs {
         let ino = ino as u32;
         let names =  match self.db.list_xattr(ino) {
             Ok(n) => n,
-            Err(err) => {reply.error(ENOENT); debug!("{}", err); return;}
+            Err(err) => {reply.error(ENODATA); debug!("{}", err); return;}
         };
         let mut data: Vec<u8> = Vec::new();
         for v in names {
