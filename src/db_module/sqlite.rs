@@ -115,24 +115,6 @@ fn add_dentry(entry: DEntry, tx: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn inclease_nlink(inode: u32, tx: &Connection) -> Result<u32> {
-    let mut nlink: u32 = tx.query_row("SELECT nlink FROM metadata WHERE id=$1", params![inode], |row| row.get(0))?;
-    nlink += 1;
-    tx.execute("Update metadata SET nlink=$1 where id=$2",
-               params![nlink, inode])?;
-    Ok(nlink)
-}
-
-fn declease_nlink(inode: u32, tx: &Connection) -> Result<u32> {
-    let mut nlink: u32 = tx.query_row("SELECT nlink FROM metadata WHERE id=$1", params![inode], |row| row.get(0))?;
-    if nlink != 0 {
-        nlink -= 1;
-    }
-    tx.execute("Update metadata SET nlink=$1 where id=$2",
-               params![nlink, inode])?;
-    Ok(nlink)
-}
-
 fn parse_attr(mut stmt: Statement, params: &[&dyn ToSql]) -> Result<Option<DBFileAttr>> {
     let rows = stmt.query_map(params, |row| {
         Ok(DBFileAttr {
@@ -177,14 +159,15 @@ fn get_inode_local(inode: u32, tx: &Connection) -> Result<Option<DBFileAttr>> {
             metadata.crtime_nsec,\
             metadata.kind, \
             metadata.mode,\
-            metadata.nlink,\
+            ncount.nlink,\
             metadata.uid,\
             metadata.gid,\
             metadata.rdev,\
             metadata.flags,\
             blocknum.block_num \
             FROM metadata \
-            LEFT JOIN (SELECT count(block_num) block_num FROM data WHERE file_id=$1) AS blocknum
+            LEFT JOIN (SELECT count(block_num) block_num FROM data WHERE file_id=$1) AS blocknum \
+            LEFT JOIN ( SELECT COUNT(child_id) nlink FROM dentry WHERE child_id=$1 GROUP BY child_id) AS ncount \
             WHERE id=$1";
     let stmt = tx.prepare(sql)?;
     let params = params![inode];
@@ -217,6 +200,12 @@ fn get_dentry_single(parent: u32, name: &str, tx: &Connection) -> Result<Option<
 fn delete_dentry_local(parent: u32, name: &str, tx: &Connection) -> Result<()> {
     let sql = "DELETE FROM dentry WHERE parent_id=$1 and name=$2";
     tx.execute(sql, params![parent, name])?;
+    Ok(())
+}
+
+fn delete_sub_dentry(id: u32, tx: &Connection) -> Result<()> {
+    let sql = "DELETE FROM dentry WHERE parent_id=$1";
+    tx.execute(sql, params![id])?;
     Ok(())
 }
 
@@ -405,7 +394,6 @@ impl DbModule for Sqlite {
                     flags: 0
                 };
                 add_inode_local(&root_dir, &self.conn)?;
-                inclease_nlink(1, &self.conn)?;
             }
         }
         {
@@ -446,7 +434,6 @@ impl DbModule for Sqlite {
         let child = add_inode_local(attr, &tx)?;
         let dentry = DEntry{parent_ino: parent, child_ino: child, filename: String::from(name), file_type: attr.kind};
         add_dentry(dentry, &tx)?;
-        inclease_nlink(child, &tx)?;
         if attr.kind == FileType::Directory {
             let dentry = DEntry{parent_ino: child, child_ino: parent, filename: String::from(".."), file_type: attr.kind};
             add_dentry(dentry, &tx)?;
@@ -525,7 +512,7 @@ impl DbModule for Sqlite {
     }
 
     fn delete_inode_if_noref(&mut self, inode: u32) -> Result<()> {
-        let sql = "SELECT nlink FROM metadata WHERE id=$1";
+        let sql = "SELECT count(child_id) FROM dentry WHERE child_id=$1";
         let tx = self.conn.transaction()?;
         let nlink: u32;
         {
@@ -590,7 +577,6 @@ impl DbModule for Sqlite {
             filename: name.to_string()
         };
         add_dentry(entry, &tx)?;
-        inclease_nlink(inode, &tx)?;
         update_mtime(inode, now, &tx)?;
         update_mtime(parent, now, &tx)?;
         update_ctime(parent, now, &tx)?;
@@ -608,7 +594,7 @@ impl DbModule for Sqlite {
             child = stmt.query_row(params![parent, name], |row| row.get(0))?;
         }
         delete_dentry_local(parent, name, &tx)?;
-        declease_nlink(child, &tx)?;
+        delete_sub_dentry(child, &tx)?;
         update_ctime(child, now, &tx)?;
         update_mtime(parent, now, &tx)?;
         update_ctime(parent, now, &tx)?;
@@ -673,7 +659,6 @@ impl DbModule for Sqlite {
                 }
             }
             delete_dentry_local(new_parent, new_name, &tx)?;
-            declease_nlink(exist_id, &tx)?;
             res = Some(v.child_ino);
         }
         tx.execute(sql, params![new_parent, new_name, parent, name])?;
@@ -710,7 +695,7 @@ impl DbModule for Sqlite {
             metadata.crtime_nsec,\
             metadata.kind, \
             metadata.mode,\
-            metadata.nlink,\
+            ncount.nlink,\
             metadata.uid,\
             metadata.gid,\
             metadata.rdev,\
@@ -722,7 +707,9 @@ impl DbModule for Sqlite {
             AND dentry.parent_id=$1 \
             AND dentry.name=$2 \
             LEFT JOIN (SELECT file_id file_id, count(block_num) block_num from data) AS blocknum \
-            ON dentry.child_id = blocknum.file_id
+            ON dentry.child_id = blocknum.file_id \
+            LEFT JOIN ( SELECT child_id, COUNT(child_id) nlink FROM dentry GROUP BY child_id) AS ncount \
+            ON dentry.child_id = ncount.child_id \
             ";
         let tx = self.conn.transaction()?;
         let stmt = tx.prepare(sql)?;
@@ -781,7 +768,10 @@ impl DbModule for Sqlite {
     }
 
     fn delete_all_noref_inode(&mut self) -> Result<()> {
-        self.conn.execute("DELETE FROM metadata WHERE nlink=0", params![])?;
+        self.conn.execute(
+            "DELETE FROM metadata WHERE NOT EXISTS (SELECT 'x' FROM dentry WHERE metadata.id = dentry.child_id)",
+            params![]
+        )?;
         Ok(())
     }
 
