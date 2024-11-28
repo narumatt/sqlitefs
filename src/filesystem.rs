@@ -498,7 +498,15 @@ impl Filesystem for SqliteFs {
             let mut block_data: Vec<u8> = Vec::with_capacity(block_size as usize);
             let b_start_index = if i == start_block {offset % block_size} else {0};
             let b_end_index = if i == end_block {(offset+size-1) % block_size +1} else {block_size};
-            let data_offset = (i - start_block) * block_size;
+            let data_offset;
+            if (i > start_block) {
+                //The blocks don't need to be in perfect alignment.
+                data_offset =
+                        ((i - start_block - 1) * block_size) + (block_size) - offset % block_size;
+            } else {
+                data_offset = 0;
+            }
+
             if (b_start_index != 0) || (b_end_index != block_size) {
                 let mut data_pre = match self.db.get_data(ino, i, block_size) {
                     Ok(n) => n,
