@@ -2,7 +2,7 @@
 name = "sqlite-fs"
 version = "0.1.0"
 authors = ["Matsumura <naruaki.matt@gmail.com>"]
-edition = "2018"
+edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -14,12 +14,18 @@ failure = "0.1"
 log = "0.4"
 env_logger = "0.7"
 time = "0.1"
-clap = "2.33"
-nix = "0.15"
+
+[dependencies.clap]
+version = "4.5.26"
+features = ["cargo","color"]
 
 [dependencies.rusqlite]
 version = "0.20.0"
 features = ["bundled", "blob"]
+
+[dependencies.nix]
+version = "0.29"
+features = ["fs"]
 
 [dev-dependencies]
 tempfile = "3"

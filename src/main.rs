@@ -4,30 +4,31 @@
 use std::env;
 use std::ffi::OsStr;
 use sqlite_fs::filesystem::SqliteFs;
-use clap::{App, Arg};
+use clap::{Arg};
 use sqlite_fs::db_module::sqlite::Sqlite;
 use sqlite_fs::db_module::DbModule;
+use std::path::PathBuf;
 
 fn main() {
     env_logger::init();
 
-    let mount_option_arg = Arg::with_name("mount_option")
-        .short("o")
+    let mount_option_arg = Arg::new("mount_option")
+        .short('o')
         .long("option")
         .help("Additional mount option for this filesystem")
-        .takes_value(true)
-        .multiple(true);
+        .value_parser(clap::builder::NonEmptyStringValueParser::new())
+        .num_args(1..);
 
-    let mount_point_arg = Arg::with_name("mount_point")
+    let mount_point_arg = Arg::new("mount_point")
         .help("Target mountpoint path")
         .index(1)
         .required(true);
 
-    let db_path_arg = Arg::with_name("db_path")
+    let db_path_arg = Arg::new("db_path")
         .help("Sqlite database file path. If not set, open database in memory.")
         .index(2);
 
-    let matches = App::new("sqlitefs")
+    let matches = command!()
         .about("Sqlite database as a filesystem.")
         .version(crate_version!())
         .arg(mount_option_arg)
@@ -36,15 +37,15 @@ fn main() {
         .get_matches();
 
     let mut option_vals = ["-o", "fsname=sqlitefs", "-o", "default_permissions", "-o", "allow_other"].to_vec();
-    if let Some(v) = matches.values_of("mount_option") {
+    if let Some(v) = matches.get_many::<String>("mount_option") {
         for i in v {
             option_vals.push("-o");
             option_vals.push(i);
         }
     }
 
-    let mountpoint = matches.value_of("mount_point").expect("Mount point path is missing.");
-    let db_path = matches.value_of("db_path");
+    let mountpoint = matches.get_one::<String>("mount_point").expect("Mount point path is missing.");
+    let db_path = matches.get_one::<String>("db_path");
     let options = option_vals
         .iter()
         .map(|o| o.as_ref())
